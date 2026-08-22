@@ -1,0 +1,235 @@
+# ==============================================================================
+# IEC 61499 分布式工业控制系统 —— 节点配置文件 (core/nodes.yaml)
+# ==============================================================================
+# 本文件是整个系统的"组态图纸"，定义了：
+#   1. 系统级参数（运行时目录、日志级别）；
+#   2. MQTT Broker 连接参数（通道一）；
+#   3. 集群缺省参数（心跳间隔、失联判定阈值、状态同步周期）；
+#   4. 五个节点（4 工作 + 1 热备）的角色、IP、订阅/发布主题、功能块清单。
+#
+# 各节点进程启动时按自己的 node_id 加载对应段落，自动完成：
+#   - 功能块实例化（type/name/params）；
+#   - 主题订阅（subscribe_topics）；
+#   - 心跳与状态槽上报。
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 系统级配置
+# ------------------------------------------------------------------------------
+system:
+  name: IEC61499-Distributed-Industrial-Control-System
+  version: "1.0.0"
+  runtime_dir: runtime          # 共享内存通道根目录（相对项目根）
+  log_level: INFO
+
+# ------------------------------------------------------------------------------
+# 2. MQTT Broker（通道一：跨主机网络通信）
+# ------------------------------------------------------------------------------
+mqtt:
+  enabled: true                 # 置为 false 可纯共享内存单机运行
+  host: 127.0.0.1               # Mosquitto Broker 地址
+  port: 1883
+  keepalive: 30
+
+# ------------------------------------------------------------------------------
+# 3. 集群缺省参数（可被节点级覆盖）
+# ------------------------------------------------------------------------------
+defaults:
+  heartbeat_interval_ms: 1000   # 心跳发布周期
+  heartbeat_timeout_ms: 3000    # 连续 3 个周期未收到心跳 => 判定失联
+  sync_interval_ms: 500         # 主控状态快照同步周期（供热备节点复制）
+
+# ------------------------------------------------------------------------------
+# 4. 节点定义
+# ------------------------------------------------------------------------------
+nodes:
+
+  # ============================ 节点A：主控节点 ================================
+  # 职责：订单接收与分解、任务队列调度、节点健康监测、故障切换决策
+  # ===========================================================================
+  node_a:
+    id: node_a
+    role: orchestrator
+    description: 主控节点 —— 订单分解 / 任务调度 / 健康监测 / 故障切换
+    ip: 192.168.10.101
+    port: 5101
+    heartbeat_interval_ms: 500          # 主控心跳更快，缩短热备检测窗口
+    subscribe_topics:
+      - factory/orders/#                # 订单入口（模拟器 / Web）
+      - factory/web/orders              # Web 控制台手动下单
+      - factory/events                  # 任务执行结果（完成/失败/进度）
+      - factory/heartbeat/#             # 全部节点心跳（健康监测数据源）
+      - factory/vision/results          # 视觉检测结果
+      - factory/alerts                  # 告警
+      - factory/config/node_a           # 面向自己的参数下发
+      - factory/failover                # 热备切换事件（感知备用节点接管）
+    publish_topics:
+      - factory/tasks/#                 # 任务派发
+      - factory/heartbeat/node_a        # 自身心跳
+      - factory/sync/node_a             # 状态快照同步（热备数据源）
+      - factory/alerts                  # 告警
+    function_blocks:
+      - type: OrderManagerFB
+        name: order_manager
+        params:
+          split_granularity: 1          # 每件产品拆分的任务数基数
+          default_priority: 2
+      - type: TaskQueueFB
+        name: task_queue
+        params:
+          max_queue_size: 200           # 队列深度上限
+          max_retry: 3                  # 任务失败重试上限
+          dispatch_batch: 4             # 每轮最多派发任务数
+      - type: HealthMonitorFB
+        name: health_monitor
+        params:
+          timeout_ms: 3000              # 心跳失联阈值
+          alert_level: HIGH
+      - type: FailoverControllerFB
+        name: failover_ctrl
+        params:
+          standby_node: node_e
+          requeue_on_worker_down: true
+
+  # ============================ 节点B：机器人节点 ==============================
+  # 职责：物料搬运、坐标系标定、轨迹规划（全部为模拟量输出）
+  # ===========================================================================
+  node_b:
+    id: node_b
+    role: robot
+    description: 机器人节点 —— 搬运执行 / 坐标系标定 / 轨迹规划
+    ip: 192.168.10.102
+    port: 5102
+    subscribe_topics:
+      - factory/tasks/node_b            # 面向自己的任务派发
+      - factory/config/node_b           # 参数下发
+    publish_topics:
+      - factory/events                  # 任务结果
+      - factory/heartbeat/node_b
+    function_blocks:
+      - type: TaskRouterFB
+        name: task_router
+        params: {}
+      - type: MaterialHandlingFB
+        name: handling
+        params:
+            speed_ratio: 1.0            # 速度倍率（0.1 ~ 2.0）
+            gripper_force: 35.0         # 夹爪力(N)
+      - type: CalibrationFB
+        name: calibration
+        params:
+          points: 9                     # 标定点数（9点标定法）
+          acceptance_rmse: 0.05         # 标定合格判定 (mm)
+      - type: TrajectoryPlannerFB
+        name: trajectory
+        params:
+          max_velocity: 1200.0          # 最大速度 mm/s
+          max_accel: 8000.0             # 最大加速度 mm/s^2
+          blend_radius: 5.0             # 拐角过渡半径 mm
+
+  # ============================ 节点C：PLC节点 =================================
+  # 职责：传送带控制、气缸伸缩、伺服定位（模拟传统PLC的IO控制）
+  # ===========================================================================
+  node_c:
+    id: node_c
+    role: plc
+    description: PLC节点 —— 传送带 / 气缸 / 伺服电机控制
+    ip: 192.168.10.103
+    port: 5103
+    subscribe_topics:
+      - factory/tasks/node_c
+      - factory/config/node_c
+    publish_topics:
+      - factory/events
+      - factory/heartbeat/node_c
+    function_blocks:
+      - type: TaskRouterFB
+        name: task_router
+        params: {}
+      - type: ConveyorControlFB
+        name: conveyor
+        params:
+          rated_speed: 0.5              # 额定速度 m/s
+          length_m: 3.0                 # 皮带长度
+          soft_start_s: 0.8             # 软启动时间
+      - type: CylinderControlFB
+        name: cylinder
+        params:
+          stroke_time_ms: 800           # 单程伸缩时间
+          sensor_debounce_ms: 20        # 磁性开关防抖
+      - type: ServoPositionFB
+        name: servo
+        params:
+            max_rpm: 3000               # 最高转速
+            pitch_mm: 5.0               # 丝杠导程
+            positioning_tol: 0.02       # 定位容差 mm
+
+  # ============================ 节点D：视觉节点 ================================
+  # 职责：模拟图像采集、AI推理缺陷检测、结果回传主控
+  # ===========================================================================
+  node_d:
+    id: node_d
+    role: vision
+    description: 视觉节点 —— 图像采集 / AI推理 / 缺陷分类
+    ip: 192.168.10.104
+    port: 5104
+    subscribe_topics:
+      - factory/tasks/node_d
+      - factory/config/node_d
+    publish_topics:
+      - factory/events
+      - factory/vision/results
+      - factory/heartbeat/node_d
+    function_blocks:
+      - type: TaskRouterFB
+        name: task_router
+        params: {}
+      - type: ImageAcquisitionFB
+        name: camera
+        params:
+          exposure_us: 8000             # 曝光时间 (us)
+          frame_width: 2448             # 分辨率
+          frame_height: 2048
+      - type: AIInferenceFB
+        name: inference
+        params:
+          model_version: v2.3.1         # 模型版本
+          infer_latency_ms: 45          # 模拟推理耗时
+      - type: DefectClassifierFB
+        name: classifier
+        params:
+          ng_threshold: 0.65            # 缺陷概率判定阈值（可在线调整）
+          classes: [划痕, 凹陷, 污渍, 边缘破损]
+
+  # ============================ 节点E：热备节点 ================================
+  # 职责：监听主控心跳、复制任务队列状态、50ms 内完成热备接管
+  # ===========================================================================
+  node_e:
+    id: node_e
+    role: standby
+    description: 热备节点 —— 主控状态复制 / 故障检测 / 50ms级热切换
+    ip: 192.168.10.105
+    port: 5105
+    subscribe_topics:
+      - factory/heartbeat/node_a        # 主控心跳（故障检测源）
+      - factory/sync/node_a             # 主控状态快照（复制数据源）
+      - factory/tasks/#                 # 观察派发流（接管后无缝续跑）
+      - factory/events
+      - factory/config/node_e
+      - factory/orders/#                # 接管后直接接收新订单
+    publish_topics:
+      - factory/tasks/#                 # 接管后以主控身份派发任务
+      - factory/heartbeat/node_e
+      - factory/failover                # 切换事件
+      - factory/alerts
+    function_blocks:
+      - type: StandbyMonitorFB
+        name: standby_monitor
+        params:
+          master_node: node_a
+          timeout_ms: 1500              # 主控失联判定窗口（3 x 500ms 心跳）
+          takeover_budget_ms: 50        # 切换动作预算（承诺的接管时限）
+      - type: TaskQueueReplicaFB
+        name: queue_replica
+        params:
+          replica_lag_ms: 100           # 允许的状态复制延迟
