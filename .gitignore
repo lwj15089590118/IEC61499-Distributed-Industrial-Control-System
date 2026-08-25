@@ -1,0 +1,15 @@
+# ---- Python 编译产物 ----
+__pycache__/
+*.py[cod]
+
+# ---- 运行时共享内存区（bus.jsonl/状态槽/租约/故障指令/持久化日志）----
+runtime/
+
+# ---- 测试与虚拟环境 ----
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
