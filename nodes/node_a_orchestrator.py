@@ -300,26 +300,42 @@ class TaskQueueFB(FunctionBlock):
         self._dispatch()
 
     def _dispatch(self) -> None:
-        """派发一轮：从堆顶取任务，跳过失联节点，批量发出 TASK_DISPATCHED。"""
+        """派发一轮：按优先级取可派发任务，跳过失联目标，批量发出 TASK_DISPATCHED。"""
         if self.state.get("paused"):
             return                      # 主控让位后暂停派发（防双主控并存）
         batch = int(self.di["dispatch_batch"])
         dispatched = 0
         while dispatched < batch and self._heap:
-            priority, _, task = self._heap[0]
-            if task["target_node"] in self._offline_nodes:
-                # 目标节点失联：任务留在队首，等 NODE_UP 再派
+            idx = self._first_dispatchable_idx()
+            if idx is None:
+                # 队列中所有任务的目标节点都失联：任务保留，等 NODE_UP 再派
                 break
-            heapq.heappop(self._heap)
+            priority, _, task = self._heap.pop(idx)
+            heapq.heapify(self._heap)               # 移除任意位置后恢复堆序
             self._inflight[task["task_id"]] = task
             self.state["dispatched"] += 1
             dispatched += 1
-            self.do["queued"] = len(self._heap)
-            self.do["inflight"] = len(self._inflight)
-            # 派发事件：随行完整任务描述 + 当前领导者纪元（fencing）
+            # 派发事件：随行完整任务描述 + 当前优先级（fencing）
             self.emit("TASK_DISPATCHED", dict(task, epoch_priority=priority))
         self.do["queued"] = len(self._heap)
         self.do["inflight"] = len(self._inflight)
+
+    def _first_dispatchable_idx(self) -> Optional[int]:
+        """
+        找到堆中优先级最高且目标节点在线的任务下标。
+
+        原实现只看堆顶、目标失联就整体停摆——一个节点宕机会饿死全部
+        其他健康节点的任务（与"按节点健康状态派发"的设计承诺相悖）。
+        现改为跳过不可派发任务：失联目标的任务原地保留，其余照常流转。
+        """
+        best: Optional[int] = None
+        for i, (priority, seq, task) in enumerate(self._heap):
+            if task["target_node"] in self._offline_nodes:
+                continue
+            if best is None or (priority, seq) < (self._heap[best][0],
+                                                  self._heap[best][1]):
+                best = i
+        return best
 
     # ------------------------------------------------------------ 快照（热备同步用）
     def snapshot_tasks(self) -> List[Dict]:
