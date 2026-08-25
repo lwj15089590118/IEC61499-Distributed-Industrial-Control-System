@@ -236,10 +236,19 @@ class StandbyMonitorFB(FunctionBlock):
 
     # ------------------------------------------------ 接管后的派发泵
     def pump_dispatch(self) -> None:
-        """接管后周期性从副本队列取任务派发（模拟主控的调度循环）。"""
-        if self.state["mode"] != "active" or not self.replica:
+        """接管后周期性续约租约并从副本队列取任务派发（模拟主控的调度循环）。"""
+        if self.state["mode"] != "active":
             return
-        self.replica.handle_event("POP", {})
+        # 接管态必须持续续约领导者租约：否则租约 2s 后过期，旧主控恢复时会
+        # 以更高 epoch 抢回租约并恢复派发，epoch fencing 失效形成双主控；
+        # 同时 Web 控制台的"当前主控"也会显示为无。
+        if self.runtime_ref is not None:
+            lease = try_acquire_leader("node_e", self.runtime_ref.runtime_dir,
+                                       ttl_ms=2000)
+            self.runtime_ref.epoch = max(int(lease.get("epoch", 0)),
+                                         self.runtime_ref.epoch)
+        if self.replica is not None:
+            self.replica.handle_event("POP", {})
 
 
 # ==============================================================================
