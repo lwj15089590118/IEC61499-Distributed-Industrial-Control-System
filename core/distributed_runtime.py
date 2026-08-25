@@ -451,7 +451,7 @@ class SharedMemoryChannel:
         self._watchers.clear()
 
     def _watch_loop(self, filename: str) -> None:
-        """tail 单个文件：增量读取新行并回调（跳过自己发出的消息）。"""
+        """tail 单个文件：增量读取完整行并回调（跳过自己发出的消息）。"""
         path = self.runtime_dir / filename
         while not self._stop_evt.is_set():
             try:
@@ -462,22 +462,30 @@ class SharedMemoryChannel:
                 offset = self._offsets.get(filename, 0)
                 if size < offset:                    # 文件被截断（重启清理）
                     offset = 0
+                    self._offsets[filename] = 0
                 if size == offset:
                     time.sleep(0.02)                # 20ms 轮询粒度
                     continue
+                # 只消费到最后一个换行符为止：写入方正在追加的"半行"
+                # 留在文件里下轮重读（读端不加锁，不能假设读到的一定是整行）
                 with open(path, "r", encoding="utf-8") as fp:
                     fp.seek(offset)
-                    for line in fp:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            msg = Message.from_json(line)
-                        except ValueError:
-                            continue                # 半写行：下次重读
-                        if msg.source != self.node_id:
-                            self.on_message(msg)
-                    self._offsets[filename] = fp.tell()
+                    data = fp.read()
+                last_nl = data.rfind("\n")
+                if last_nl < 0:
+                    time.sleep(0.02)                # 尚无完整行：等写入方补齐
+                    continue
+                for line in data[:last_nl].split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = Message.from_json(line)
+                    except ValueError:
+                        continue                # 损坏行：跳过，不阻塞后续
+                    if msg.source != self.node_id:
+                        self.on_message(msg)
+                self._offsets[filename] = offset + last_nl + 1
             except OSError as exc:
                 logger.error("[%s] watcher读取异常(%s): %s",
                              self.node_id, filename, exc)

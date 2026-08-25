@@ -223,14 +223,20 @@ class Message:
 
     @classmethod
     def from_json(cls, text: str) -> "Message":
-        """从 JSON 字符串解析消息对象；解析失败时抛出 ValueError。"""
+        """从 JSON 字符串解析消息对象；解析失败或字段类型漂移时抛出 ValueError。"""
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError("消息JSON解析失败: %s" % exc) from exc
         if not isinstance(data, dict):
             raise ValueError("消息JSON必须为对象")
-        return cls.from_dict(data)
+        try:
+            return cls.from_dict(data)
+        except (TypeError, ValueError) as exc:
+            # 字段类型漂移（如 payload 非字典、timestamp 非数值）统一归一为
+            # ValueError：所有读取端（watcher/重放/日志）按"跳过坏行"处理，
+            # 避免 TypeError 击穿只捕获 ValueError 的调用方、拖垮读取线程。
+            raise ValueError("消息字段类型漂移: %s" % exc) from exc
 
     # ------------------------------------------------------------------ 便捷方法
     @property
