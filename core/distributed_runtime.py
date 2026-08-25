@@ -451,7 +451,13 @@ class SharedMemoryChannel:
         self._watchers.clear()
 
     def _watch_loop(self, filename: str) -> None:
-        """tail 单个文件：增量读取完整行并回调（跳过自己发出的消息）。"""
+        """
+        tail 单个文件：增量读取完整行并回调（跳过自己发出的消息）。
+
+        注意必须以二进制模式读取：偏移量按字节累计，若用文本模式，
+        中文等多字节字符会造成"字符数当字节数"的错位，seek 落进
+        多字节序列中间触发 UnicodeDecodeError 并杀死监视线程。
+        """
         path = self.runtime_dir / filename
         while not self._stop_evt.is_set():
             try:
@@ -468,20 +474,20 @@ class SharedMemoryChannel:
                     continue
                 # 只消费到最后一个换行符为止：写入方正在追加的"半行"
                 # 留在文件里下轮重读（读端不加锁，不能假设读到的一定是整行）
-                with open(path, "r", encoding="utf-8") as fp:
+                with open(path, "rb") as fp:
                     fp.seek(offset)
                     data = fp.read()
-                last_nl = data.rfind("\n")
+                last_nl = data.rfind(b"\n")
                 if last_nl < 0:
                     time.sleep(0.02)                # 尚无完整行：等写入方补齐
                     continue
-                for line in data[:last_nl].split("\n"):
-                    line = line.strip()
+                for raw in data[:last_nl].split(b"\n"):
+                    line = raw.strip()
                     if not line:
                         continue
                     try:
-                        msg = Message.from_json(line)
-                    except ValueError:
+                        msg = Message.from_json(line.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
                         continue                # 损坏行：跳过，不阻塞后续
                     if msg.source != self.node_id:
                         self.on_message(msg)
@@ -489,6 +495,10 @@ class SharedMemoryChannel:
             except OSError as exc:
                 logger.error("[%s] watcher读取异常(%s): %s",
                              self.node_id, filename, exc)
+                time.sleep(0.2)
+            except Exception as exc:  # noqa: BLE001 监视线程绝不允许静默死亡
+                logger.exception("[%s] watcher(%s)未预期异常: %s",
+                                 self.node_id, filename, exc)
                 time.sleep(0.2)
 
     # ------------------------------------------------------------------ 工具
