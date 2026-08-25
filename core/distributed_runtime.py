@@ -722,10 +722,16 @@ class DistributedRuntime:
         self.role = role or node_cfg.get("role", "worker")
         self.description = node_cfg.get("description", "")
         self.ip = node_cfg.get("ip", "127.0.0.1")
+        # ---- 集群缺省参数（允许被节点级配置覆盖，见 nodes.yaml "可被节点级覆盖"）----
         defaults = self.config.get("defaults", {})
-        self.heartbeat_interval = float(defaults.get("heartbeat_interval_ms", 1000)) / 1000.0
-        self.heartbeat_timeout = float(defaults.get("heartbeat_timeout_ms", 3000)) / 1000.0
-        self.sync_interval = float(defaults.get("sync_interval_ms", 500)) / 1000.0
+
+        def _cfg_ms(key: str, fallback: float) -> float:
+            """先取节点级覆盖值，缺省回落到集群默认，最后落到内置兜底。"""
+            return float(node_cfg.get(key, defaults.get(key, fallback)))
+
+        self.heartbeat_interval = _cfg_ms("heartbeat_interval_ms", 1000) / 1000.0
+        self.heartbeat_timeout = _cfg_ms("heartbeat_timeout_ms", 3000) / 1000.0
+        self.sync_interval = _cfg_ms("sync_interval_ms", 500) / 1000.0
 
         # ---- 核心组件 ----
         self.bus = EventBus(node_id, workers=3,
