@@ -376,7 +376,8 @@ def api_overview():
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="分布式控制系统 Web 控制台")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    # 默认只绑定本机回环地址：控制台无鉴权，不应默认暴露到外部网卡
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址")
     parser.add_argument("--port", type=int, default=5000, help="监听端口")
     parser.add_argument("--config", default=None, help="nodes.yaml 路径")
     parser.add_argument("--debug", action="store_true", help="Flask调试模式")

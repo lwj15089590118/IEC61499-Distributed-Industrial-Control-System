@@ -48,8 +48,9 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 # ---- 保证无论从哪个目录启动，都能找到项目根下的包 ----
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -250,8 +251,11 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     加载 nodes.yaml 配置。
 
     优先使用 PyYAML；未安装时退化为 _mini_yaml_load（覆盖本项目配置子集）。
+    路径解析顺序：显式参数 > 环境变量 IEC61499_CONFIG > 默认 core/nodes.yaml
+    （环境变量供自动化测试把整个集群指向临时目录，保证用例可重复执行）。
     """
-    cfg_path = Path(path or DEFAULT_CONFIG_PATH)
+    cfg_path = Path(path or os.environ.get("IEC61499_CONFIG", "")
+                    or DEFAULT_CONFIG_PATH)
     if not cfg_path.exists():
         logger.warning("配置文件不存在，使用内置默认配置: %s", cfg_path)
         return _default_config()
@@ -315,6 +319,7 @@ class MQTTChannel:
         self._subscriptions = list(subscriptions)
 
         def _on_connect(client, userdata, flags, rc, *args):  # noqa: ANN001
+            # rc 在 paho 1.x 为 int、2.x 为 ReasonCode，二者均支持与 0 直接比较
             if rc == 0:
                 self.available = True
                 for pattern in self._subscriptions:
@@ -333,17 +338,24 @@ class MQTTChannel:
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] MQTT报文处理异常: %s", self.node_id, exc)
 
-        self._client = mqtt.Client(client_id="%s-%d" % (self.node_id,
-                                                        random.randint(1000, 9999)),
-                                   callback_api_version=mqtt.CallbackAPIVersion.VERSION2
-                                   if hasattr(mqtt, "CallbackAPIVersion") else None)
-        self._client.on_connect = _on_connect
-        self._client.on_message = _on_message
+        # 客户端构造整体 try 包裹：paho-mqtt 1.x 的 Client.__init__ 没有
+        # callback_api_version 形参，若不兼容分支会让节点启动即崩（P1）。
         try:
+            client_id = "%s-%d" % (self.node_id, random.randint(1000, 9999))
+            if hasattr(mqtt, "CallbackAPIVersion"):          # paho-mqtt 2.x
+                self._client = mqtt.Client(
+                    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                    client_id=client_id)
+            else:                                            # paho-mqtt 1.x
+                self._client = mqtt.Client(client_id=client_id)
+            self._client.on_connect = _on_connect
+            self._client.on_message = _on_message
             self._client.connect_async(self.host, self.port, keepalive=30)
             self._client.loop_start()                        # 后台网络线程
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] MQTT连接异常（通道禁用）: %s", self.node_id, exc)
+            logger.warning("[%s] MQTT初始化/连接异常（通道禁用）: %s",
+                           self.node_id, exc)
+            self._client = None
 
     def send(self, msg: Message) -> bool:
         """发布消息到 broker；通道不可用时返回 False。"""
@@ -382,10 +394,13 @@ class SharedMemoryChannel:
     跨主机部署时可将 runtime 目录放到共享存储，或直接依赖 MQTT 通道。
 
     写入互斥：FileLock；读取：记录每文件偏移量，增量解析新行。
+    事件流 bus.jsonl 超过单文件上限时滚动为 bus.jsonl.1（保留一份历史），
+    防止长跑产物无限膨胀；watcher 侧对"文件变小"已有截断重读逻辑。
     """
 
     BUS_FILE = "bus.jsonl"
     CMD_FILE = "commands.jsonl"
+    BUS_MAX_BYTES = 10 * 1024 * 1024            # bus.jsonl 单文件上限（10MB）
 
     def __init__(self, node_id: str, runtime_dir: Path,
                  on_message: Callable[[Message], None],
@@ -422,6 +437,7 @@ class SharedMemoryChannel:
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
             path = str(self.runtime_dir / self.BUS_FILE)
             with FileLock(path):
+                self._rotate_if_oversize(Path(path))
                 with open(path, "a", encoding="utf-8") as fp:
                     fp.write(msg.to_json() + "\n")
             self.sent_count += 1
@@ -429,6 +445,18 @@ class SharedMemoryChannel:
         except OSError as exc:
             logger.error("[%s] 共享内存通道写入失败: %s", self.node_id, exc)
             return False
+
+    def _rotate_if_oversize(self, path: Path) -> None:
+        """（调用方需持有写锁）事件流超过上限时滚动为 <name>.1，保留一份历史。"""
+        try:
+            if path.exists() and path.stat().st_size > self.BUS_MAX_BYTES:
+                rotated = path.with_name(path.name + ".1")
+                os.replace(str(path), str(rotated))     # 原子替换旧历史
+                logger.info("[%s] 事件流已达上限，滚动为 %s",
+                            self.node_id, rotated.name)
+        except OSError as exc:
+            logger.warning("[%s] 事件流滚动失败（继续追加写）: %s",
+                           self.node_id, exc)
 
     # ------------------------------------------------------------------ 监听
     def start(self, watch_commands: bool = True) -> None:
@@ -569,32 +597,36 @@ def try_acquire_leader(node_id: str, runtime_dir: Path,
     - force=True：强制接管（epoch+1），供备用节点在主控失联时使用；
     - 返回最新租约内容。epoch 单调递增，作为 fencing token 附加在
       任务派发消息上，工作节点据此拒绝旧纪元的过期指令（防脑裂）。
+
+    读-改-写全程持有文件锁：主控续约与热备 force 接管并发时，
+    保证"读旧值->写新值"不会被交错成同纪元双写。
     """
     Path(runtime_dir).mkdir(parents=True, exist_ok=True)
     path = Path(runtime_dir) / "leader_lease.json"
-    lease: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            lease = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            lease = {}
-    now = time.time() * 1000.0
-    expired = lease.get("expires_at", 0) < now
-    held_by_me = lease.get("leader") == node_id
-    if force or expired or held_by_me or not lease:
-        if not held_by_me or force:
-            lease["epoch"] = int(lease.get("epoch", 0)) + 1
-        lease["leader"] = node_id
-        lease["acquired_at"] = now
-        lease["expires_at"] = now + ttl_ms
-        tmp = Path(runtime_dir) / "leader_lease.json.tmp"
-        tmp.write_text(json.dumps(lease), encoding="utf-8")
-        os.replace(str(tmp), str(path))
+    with FileLock(str(path)):
+        lease: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                lease = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                lease = {}
+        now = time.time() * 1000.0
+        expired = lease.get("expires_at", 0) < now
+        held_by_me = lease.get("leader") == node_id
+        if force or expired or held_by_me or not lease:
+            if not held_by_me or force:
+                lease["epoch"] = int(lease.get("epoch", 0)) + 1
+            lease["leader"] = node_id
+            lease["acquired_at"] = now
+            lease["expires_at"] = now + ttl_ms
+            tmp = Path(runtime_dir) / "leader_lease.json.tmp"
+            tmp.write_text(json.dumps(lease), encoding="utf-8")
+            os.replace(str(tmp), str(path))
     return lease
 
 
-def current_leader(runtime_dir: Path) -> Optional[str]:
-    """查询当前有效的领导者（租约过期返回 None）。"""
+def read_leader_lease(runtime_dir: Path) -> Optional[Dict[str, Any]]:
+    """读取当前"有效"租约（未过期返回 {leader, epoch, ...}，否则 None）。"""
     path = Path(runtime_dir) / "leader_lease.json"
     if not path.exists():
         return None
@@ -602,7 +634,15 @@ def current_leader(runtime_dir: Path) -> Optional[str]:
         lease = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return lease.get("leader") if lease.get("expires_at", 0) >= time.time() * 1000 else None
+    if lease.get("expires_at", 0) < time.time() * 1000.0:
+        return None
+    return lease
+
+
+def current_leader(runtime_dir: Path) -> Optional[str]:
+    """查询当前有效的领导者（租约过期返回 None）。"""
+    lease = read_leader_lease(runtime_dir)
+    return lease.get("leader") if lease else None
 
 
 # ==============================================================================
@@ -706,7 +746,61 @@ class SchedulerEngine:
 
 
 # ==============================================================================
-# 8. 分布式运行时主体
+# 8. 事件连接组态（nodes.yaml connections 段 -> bind_input/route_output）
+# ==============================================================================
+
+
+def apply_connections(rt: "DistributedRuntime", conns: Dict[str, Any],
+                      fb_index: Dict[str, FunctionBlock]) -> None:
+    """
+    按 nodes.yaml 节点段下的 connections 组态建立事件连接，
+    兑现"组态优于编程"：应用拓扑重构只改绑定配置，不改代码。
+
+    结构：
+      connections:
+        binds:   # 主题过滤器 -> 功能块事件输入
+          - { topic: "factory/orders", fb: order_manager, event: NEW_ORDER }
+        routes:  # 功能块事件输出 -> 主题（静态主题；动态主题路由仍在代码中）
+          - { fb: health_monitor, event: NODE_OFFLINE, topic: "factory/alerts",
+              event_type: NODE_OFFLINE, priority: CRITICAL, scope: global }
+
+    event_type/priority 接受枚举名（如 NODE_OFFLINE / CRITICAL）或枚举值；
+    缺省 event_type 取事件输出名大写、priority=NORMAL、scope=global，
+    与 route_output 的缺省行为一致。
+    """
+
+    def _fb(item: Dict[str, Any]) -> Optional[FunctionBlock]:
+        fb = fb_index.get(str(item.get("fb", "")))
+        if fb is None:
+            logger.error("connections 引用未知功能块 %r，该条已跳过: %s",
+                         item.get("fb"), item)
+        return fb
+
+    for item in conns.get("binds", []) or []:
+        fb = _fb(item)
+        if fb is None:
+            continue
+        rt.bind_input(str(item["topic"]), fb, str(item["event"]))
+
+    for item in conns.get("routes", []) or []:
+        fb = _fb(item)
+        if fb is None:
+            continue
+        et_raw = item.get("event_type")
+        event_type = getattr(EventType, str(et_raw), None) \
+            if et_raw and str(et_raw).isidentifier() else None
+        if event_type is None and et_raw:
+            event_type = str(et_raw)          # 允许直接写枚举值字符串
+        pr_raw = item.get("priority")
+        priority = getattr(Priority, str(pr_raw)) if pr_raw \
+            else Priority.NORMAL
+        rt.route_output(fb, str(item["event"]), str(item["topic"]),
+                        event_type=event_type, priority=priority,
+                        scope=str(item.get("scope", "global")))
+
+
+# ==============================================================================
+# 9. 分布式运行时主体
 # ==============================================================================
 
 
@@ -737,6 +831,7 @@ class DistributedRuntime:
 
         # ---- 本节点的配置段 ----
         node_cfg = (self.config.get("nodes", {}) or {}).get(node_id, {})
+        self.node_cfg: Dict[str, Any] = node_cfg       # 公开（connections 组态读取）
         self.role = role or node_cfg.get("role", "worker")
         self.description = node_cfg.get("description", "")
         self.ip = node_cfg.get("ip", "127.0.0.1")
@@ -759,7 +854,9 @@ class DistributedRuntime:
         self._fbs: Dict[str, FunctionBlock] = {}
 
         # ---- 通道（on_message 统一走 _on_external_message 做去重入总线）----
-        self._seen_external: set = set()
+        # 去重窗口 deque+set：淘汰严格按最旧序，避免 set(list)[-N:] 乱序截断
+        self._seen_external: Deque[str] = deque(maxlen=2048)
+        self._seen_external_set: set = set()
         self._seen_lock = threading.Lock()
         mqtt_cfg = self.config.get("mqtt", {})
         self.mqtt = MQTTChannel(node_id,
@@ -775,9 +872,10 @@ class DistributedRuntime:
         self._threads: List[threading.Thread] = []
         self._running = False
         self.epoch = 0                               # 当前领导纪元（fencing）
+        self._max_seen_epoch = 0                     # 本地已见最大纪元（接收侧 fencing 基准）
 
     # ==========================================================================
-    # 8.1 功能块管理
+    # 9.1 功能块管理
     # ==========================================================================
 
     def register_fb(self, fb: FunctionBlock) -> FunctionBlock:
@@ -826,7 +924,7 @@ class DistributedRuntime:
         return created
 
     # ==========================================================================
-    # 8.2 事件绑定（输入）与路由（输出）
+    # 9.2 事件绑定（输入）与路由（输出）
     # ==========================================================================
 
     def bind_input(self, topic_filter: str, fb: FunctionBlock,
@@ -890,7 +988,7 @@ class DistributedRuntime:
                      self.node_id, fb.name, event_name, data)
 
     # ==========================================================================
-    # 8.3 通信：发布 / 外部消息入口
+    # 9.3 通信：发布 / 外部消息入口
     # ==========================================================================
 
     def publish(self, topic: str, event_type: Any, payload: Dict[str, Any],
@@ -910,22 +1008,28 @@ class DistributedRuntime:
         self.shm.send(msg)
 
     def _on_external_message(self, msg: Message) -> None:
-        """外部通道入口：msg_id 去重后注入本地总线。"""
+        """外部通道入口：msg_id 去重 + epoch fencing 后注入本地总线。"""
         with self._seen_lock:
-            if msg.msg_id in self._seen_external:
+            if msg.msg_id in self._seen_external_set:
                 return
-            self._seen_external.add(msg.msg_id)
-            if len(self._seen_external) > 2048:       # 防止窗口无限增长
-                self._seen_external = set(list(self._seen_external)[-1024:])
-        # fencing：忽略旧纪元的任务派发（防脑裂的接收侧防线）
+            if len(self._seen_external) >= self._seen_external.maxlen:
+                self._seen_external_set.discard(self._seen_external.popleft())
+            self._seen_external.append(msg.msg_id)
+            self._seen_external_set.add(msg.msg_id)
+        # 维护"本地已见最大纪元"（任何携带纪元的消息都刷新基准，
+        # 使工作节点无需参与租约竞争也具备接收侧 fencing 能力）
+        if msg.epoch > self._max_seen_epoch:
+            self._max_seen_epoch = msg.epoch
+        # fencing：拒绝严格早于本地已见最大纪元的任务派发（防脑裂接收侧防线）
         if msg.epoch and msg.event_type == EventType.TASK_DISPATCHED.value \
-                and msg.epoch < self.epoch:
-            logger.warning("[%s] 拒绝旧纪元(epoch=%d)指令", self.node_id, msg.epoch)
+                and msg.epoch < self._max_seen_epoch:
+            logger.warning("[%s] 拒绝旧纪元(epoch=%d < %d)指令",
+                           self.node_id, msg.epoch, self._max_seen_epoch)
             return
         self.bus.publish_local(msg, dedup=True)
 
     # ==========================================================================
-    # 8.4 生命周期：启动 / 停止 / 心跳 / 状态槽
+    # 9.4 生命周期：启动 / 停止 / 心跳 / 状态槽
     # ==========================================================================
 
     def start(self) -> None:
@@ -1016,7 +1120,7 @@ class DistributedRuntime:
             self._stop_evt.wait(0.5)
 
     # ==========================================================================
-    # 8.5 状态快照（心跳/状态槽/Web 控制台共用）
+    # 9.5 状态快照（心跳/状态槽/Web 控制台共用）
     # ==========================================================================
 
     def snapshot_status(self, state: str = "running") -> Dict[str, Any]:
@@ -1028,6 +1132,7 @@ class DistributedRuntime:
             "state": state,
             "ts": round(time.time(), 3),
             "epoch": self.epoch,
+            "max_seen_epoch": self._max_seen_epoch,
             "fb_count": len(self._fbs),
             "fbs": [fb.snapshot() for fb in self._fbs.values()],
             "scheduler": self.scheduler.stats(),
@@ -1043,7 +1148,7 @@ class DistributedRuntime:
 
 
 # ==============================================================================
-# 9. 演示入口：python distributed_runtime.py --node demo
+# 10. 演示入口：python distributed_runtime.py --node demo
 # ==============================================================================
 
 

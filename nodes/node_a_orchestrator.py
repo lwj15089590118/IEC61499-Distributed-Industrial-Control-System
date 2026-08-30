@@ -28,15 +28,16 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from communication.message_types import EventType, Priority, Topics  # noqa: E402
-from core.distributed_runtime import (DistributedRuntime, configure_logger,  # noqa: E402
-                                      try_acquire_leader, current_leader)
+from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
+                                      configure_logger, current_leader,
+                                      try_acquire_leader)
 from core.function_block import (DataPort, ECC, ECCState, ECCTransition,  # noqa: E402
                                  EventPort, FunctionBlock)
 
@@ -204,6 +205,7 @@ class TaskQueueFB(FunctionBlock):
         EventPort("REQUEUE", with_inputs=["tasks"], comment="任务回队"),
         EventPort("NODE_DOWN", with_inputs=["node"], comment="节点失联"),
         EventPort("NODE_UP", with_inputs=["node"], comment="节点恢复"),
+        EventPort("CHECK_INFLIGHT", comment="周期巡检：回收超时在途任务"),
     ]
     EVENT_OUTPUTS = [
         EventPort("TASK_DISPATCHED", with_outputs=["task_id", "target_node",
@@ -214,6 +216,8 @@ class TaskQueueFB(FunctionBlock):
         "max_queue_size": DataPort("max_queue_size", "INT", 200, "队列深度上限"),
         "max_retry": DataPort("max_retry", "INT", 3, "最大重试次数"),
         "dispatch_batch": DataPort("dispatch_batch", "INT", 4, "单轮派发批量"),
+        "inflight_timeout_s": DataPort("inflight_timeout_s", "REAL", 120.0,
+                                       "在途任务超时回收阈值(秒,0=关闭)"),
     }
     DATA_OUTPUTS = {
         "queued": DataPort("queued", "INT", 0, "当前排队数"),
@@ -225,7 +229,10 @@ class TaskQueueFB(FunctionBlock):
         self._heap: List[tuple] = []                    # (priority, seq, task)
         self._seq = itertools.count(1)
         self._inflight: Dict[str, Dict] = {}            # task_id -> task（已派发未回报）
+        self._inflight_since: Dict[str, float] = {}     # task_id -> 派发时刻（超时回收）
         self._offline_nodes: set = set()                # 失联节点（暂停派发）
+        # 由装配代码注入：本节点被注入宕机/已让位时返回 True（派发静默闸门）
+        self.halt_gate: Optional[Callable[[], bool]] = None
         self.state["dispatched"] = 0
         self.state["completed"] = 0
         self.state["failed"] = 0
@@ -249,13 +256,21 @@ class TaskQueueFB(FunctionBlock):
             self._offline_nodes.discard(str(self.state.get("_ext_node", "")))
             logger.info("节点 %s 恢复在线，恢复派发", self.state.get("_ext_node"))
             self._dispatch()
+        elif event_name == "CHECK_INFLIGHT":
+            self._reclaim_stalled()
 
     def _enqueue(self, tasks: List[Dict]) -> None:
-        """任务批量入队并尝试派发（队列满时按 FIFO 丢弃最旧任务）。"""
+        """任务批量入队并尝试派发（队列满时丢弃最低优先级任务，丢低保高）。"""
         for task in tasks:
             if len(self._heap) >= int(self.di["max_queue_size"]):
-                _, _, oldest = heapq.heappop(self._heap)   # 淘汰队首最旧任务
-                logger.warning("队列已满，淘汰任务 %s", oldest["task_id"])
+                # 淘汰优先级数值最大（最低优先级）的一条，与总线层背压方向一致；
+                # 同优先级时淘汰序号较大者（更晚入队）
+                worst = max(range(len(self._heap)),
+                            key=lambda i: (self._heap[i][0], self._heap[i][1]))
+                _, _, dropped = self._heap.pop(worst)
+                heapq.heapify(self._heap)
+                logger.warning("队列已满，丢弃最低优先级任务 %s（priority=%d）",
+                               dropped["task_id"], dropped.get("priority"))
             heapq.heappush(self._heap, (int(task.get("priority", 2)),
                                         next(self._seq), task))
         if tasks:
@@ -263,10 +278,12 @@ class TaskQueueFB(FunctionBlock):
         self._dispatch()
 
     def _requeue(self, tasks: List[Dict]) -> None:
-        """故障切换：回收在途任务重新入队。"""
+        """故障切换：回收在途任务重新入队（必须先移出在途表防永久滞留/双计）。"""
         for task in tasks:
             task = dict(task)
             task["attempts"] = int(task.get("attempts", 0)) + 1
+            self._inflight.pop(str(task.get("task_id")), None)
+            self._inflight_since.pop(str(task.get("task_id")), None)
             self._enqueue([task])
         logger.info("故障回收 %d 个任务重新入队", len(tasks))
 
@@ -275,6 +292,7 @@ class TaskQueueFB(FunctionBlock):
         task_id = str(self.state.get("_ext_task_id", ""))
         status = str(self.state.get("_ext_status", "COMPLETED"))
         task = self._inflight.pop(task_id, None)
+        self._inflight_since.pop(task_id, None)
         if task is None:
             logger.debug("未知/重复结果 %s，忽略", task_id)
             return
@@ -303,6 +321,8 @@ class TaskQueueFB(FunctionBlock):
         """派发一轮：按优先级取可派发任务，跳过失联目标，批量发出 TASK_DISPATCHED。"""
         if self.state.get("paused"):
             return                      # 主控让位后暂停派发（防双主控并存）
+        if self.halt_gate is not None and self.halt_gate():
+            return                      # 本节点被注入宕机/已让位：停止派发（防旧纪元指令外流）
         batch = int(self.di["dispatch_batch"])
         dispatched = 0
         while dispatched < batch and self._heap:
@@ -313,11 +333,41 @@ class TaskQueueFB(FunctionBlock):
             priority, _, task = self._heap.pop(idx)
             heapq.heapify(self._heap)               # 移除任意位置后恢复堆序
             self._inflight[task["task_id"]] = task
+            self._inflight_since[task["task_id"]] = time.time()
             self.state["dispatched"] += 1
             dispatched += 1
             # 派发事件：随行完整任务描述 + 当前优先级（fencing）
             self.emit("TASK_DISPATCHED", dict(task, epoch_priority=priority))
         self.do["queued"] = len(self._heap)
+        self.do["inflight"] = len(self._inflight)
+
+    def _reclaim_stalled(self) -> None:
+        """
+        在途任务超时回收：派发后超过 inflight_timeout_s 仍无结果的任务
+        （执行节点忙碌丢弃/结果丢失/宕机）重新入队，消除"任务永久滞留"。
+        """
+        timeout = float(self.di["inflight_timeout_s"])
+        if timeout <= 0:
+            return
+        now = time.time()
+        stalled = [tid for tid, since in self._inflight_since.items()
+                   if now - since > timeout]
+        for tid in stalled:
+            task = self._inflight.pop(tid, None)
+            self._inflight_since.pop(tid, None)
+            if task is None:
+                continue
+            task["attempts"] = int(task.get("attempts", 0)) + 1
+            if task["attempts"] <= int(self.di["max_retry"]):
+                logger.warning("任务 %s 在途超时 %.0fs，回收重派（第 %d 次尝试）",
+                               tid, timeout, task["attempts"])
+                self._enqueue([task])
+            else:
+                self.state["failed"] += 1
+                logger.error("任务 %s 在途超时且重试耗尽，判定最终失败", tid)
+                self.emit("TASK_FAILED", {"task_id": tid,
+                                          "reason": "在途超时%d秒且重试耗尽"
+                                                    % int(timeout)})
         self.do["inflight"] = len(self._inflight)
 
     def _first_dispatchable_idx(self) -> Optional[int]:
@@ -526,40 +576,25 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt = DistributedRuntime("node_a", config_path=config_path)
     order_mgr, task_q, health, failover = rt.autoload_fbs(FB_REGISTRY)
 
-    # ---- 内部互连（等价于 IEC 61499 应用中的事件连接线）----
-    rt.route_output(order_mgr, "ORDER_SPLIT", T_ORDER_SPLIT,
-                    EventType.ORDER_SPLIT, scope="local")
-    rt.bind_input(T_ORDER_SPLIT, task_q, "ENQUEUE")
+    # ---- 事件连接：优先 nodes.yaml connections 组态；缺省回退硬编码 ----
+    # （动态主题路由与结果过滤订阅与组态无关，见下方"公共装配"）
+    fb_index = {"order_manager": order_mgr, "task_queue": task_q,
+                "health_monitor": health, "failover_ctrl": failover}
+    conns = rt.node_cfg.get("connections")
+    if conns:
+        apply_connections(rt, conns, fb_index)
+    else:
+        _wire_node_a(rt, order_mgr, task_q, health, failover)
 
+    # ---- 公共装配（动态/过滤类连接，不进组态）----
     # 任务派发：按任务的目标节点动态选择主题 factory/tasks/<node>
     rt.route_output(task_q, "TASK_DISPATCHED",
                     topic=lambda data: Topics.tasks_of(data.get("target_node", "unknown")),
                     event_type=EventType.TASK_DISPATCHED)
-    rt.route_output(task_q, "TASK_FAILED", Topics.ALERTS,
-                    EventType.ALERT, priority=Priority.HIGH)
 
-    # 健康监测：心跳入口 + 状态/失联出口（两路路由：告警外发 + 内部联动）
-    rt.bind_input("factory/heartbeat/+", health, "BEAT")
-    rt.route_output(health, "NODE_OFFLINE", Topics.ALERTS,
-                    EventType.NODE_OFFLINE, priority=Priority.CRITICAL)
-    rt.route_output(health, "NODE_OFFLINE", T_NODE_OFFLINE_EVT,
-                    EventType.NODE_OFFLINE, scope="local")
-    rt.bind_input(T_NODE_OFFLINE_EVT, task_q, "NODE_DOWN")
-    rt.bind_input(T_NODE_OFFLINE_EVT, failover, "NODE_OFFLINE")
-    rt.route_output(health, "NODE_ONLINE", T_NODE_ONLINE_EVT,
-                    EventType.NODE_ONLINE, scope="local")
-    rt.bind_input(T_NODE_ONLINE_EVT, task_q, "NODE_UP")
-
-    # 故障切换：回收任务 -> 任务队列；感知热备接管 -> 主控让位
     failover.task_queue = task_q                      # 注入队列引用用于回收
-    rt.route_output(failover, "REQUEUE", T_REQUEUE,
-                    EventType.TASK_FAILED, scope="local")
-    rt.bind_input(T_REQUEUE, task_q, "REQUEUE")
-    rt.bind_input("factory/failover", failover, "FAILOVER_DONE")
-
-    # ---- 外部输入 ----
-    rt.bind_input("factory/orders", order_mgr, "NEW_ORDER")       # 模拟器订单
-    rt.bind_input("factory/web/orders", order_mgr, "NEW_ORDER")   # Web手动下单
+    # 派发闸门：本节点被注入宕机即停发任务（防旧纪元指令在接管窗口期外流）
+    task_q.halt_gate = lambda: rt.faults.halted()
 
     # 执行结果回流：只把 TASK_COMPLETED / TASK_FAILED 送入队列结果口，
     # 进度/标定/视觉等事件虽然共用 factory/events 主题但被过滤器忽略，
@@ -576,7 +611,42 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     # ---- 状态快照引用（主循环里发布给热备节点）----
     rt._task_queue_fb = task_q
     rt._health_fb = health
+    rt._failover_fb = failover
     return rt
+
+
+def _wire_node_a(rt: DistributedRuntime, order_mgr, task_q, health,
+                 failover) -> None:
+    """硬编码事件连接（nodes.yaml 无 connections 段时的缺省回退，
+    与 core/nodes.yaml 中 node_a.connections 组态等价）。"""
+    # ---- 内部互连（等价于 IEC 61499 应用中的事件连接线）----
+    rt.route_output(order_mgr, "ORDER_SPLIT", T_ORDER_SPLIT,
+                    EventType.ORDER_SPLIT, scope="local")
+    rt.bind_input(T_ORDER_SPLIT, task_q, "ENQUEUE")
+    rt.route_output(task_q, "TASK_FAILED", Topics.ALERTS,
+                    EventType.ALERT, priority=Priority.HIGH)
+
+    # 健康监测：心跳入口 + 状态/失联出口（两路路由：告警外发 + 内部联动）
+    rt.bind_input("factory/heartbeat/+", health, "BEAT")
+    rt.route_output(health, "NODE_OFFLINE", Topics.ALERTS,
+                    EventType.NODE_OFFLINE, priority=Priority.CRITICAL)
+    rt.route_output(health, "NODE_OFFLINE", T_NODE_OFFLINE_EVT,
+                    EventType.NODE_OFFLINE, scope="local")
+    rt.bind_input(T_NODE_OFFLINE_EVT, task_q, "NODE_DOWN")
+    rt.bind_input(T_NODE_OFFLINE_EVT, failover, "NODE_OFFLINE")
+    rt.route_output(health, "NODE_ONLINE", T_NODE_ONLINE_EVT,
+                    EventType.NODE_ONLINE, scope="local")
+    rt.bind_input(T_NODE_ONLINE_EVT, task_q, "NODE_UP")
+
+    # 故障切换：回收任务 -> 任务队列；感知热备接管 -> 主控让位
+    rt.route_output(failover, "REQUEUE", T_REQUEUE,
+                    EventType.TASK_FAILED, scope="local")
+    rt.bind_input(T_REQUEUE, task_q, "REQUEUE")
+    rt.bind_input("factory/failover", failover, "FAILOVER_DONE")
+
+    # ---- 外部输入 ----
+    rt.bind_input("factory/orders", order_mgr, "NEW_ORDER")       # 模拟器订单
+    rt.bind_input("factory/web/orders", order_mgr, "NEW_ORDER")   # Web手动下单
 
 
 def main() -> None:
@@ -599,8 +669,26 @@ def main() -> None:
 
     # 2) 领导者租约续约 + 状态快照同步（热备的数据源）
     task_q = rt._task_queue_fb
+    failover_fb = rt._failover_fb
+
+    def _demoted_or_down() -> bool:
+        """
+        主控"发号施令权"失效判定（P0 防重复派发的发送侧闸门）：
+          - 本节点被注入宕机（halted：心跳已停，快照/续租同样必须停）；
+          - 已感知热备接管（FailoverControllerFB 置 demoted）；
+          - 租约当前归属其他节点（失去租约/进程重启后发现新领导者）。
+        """
+        leader = current_leader(rt.runtime_dir)
+        return (rt.faults.halted()
+                or bool(failover_fb.state.get("demoted"))
+                or (leader is not None and leader != "node_a"))
 
     def _sync_and_renew() -> None:
+        if _demoted_or_down():
+            # 宕机/让位/失租后：停发 StateSync 快照、停续租约。
+            # 否则旧主控会以（续租时 adopt 的）新纪元持续发布快照，
+            # 反复覆盖热备活队列，造成接管后大规模重复派发（P0 根因）。
+            return
         # 续约领导者租约（ttl=2s，探测周期500ms，失联后热备可强制接管）
         lease = try_acquire_leader("node_a", rt.runtime_dir, ttl_ms=2000)
         rt.epoch = int(lease.get("epoch", 0))
@@ -620,16 +708,22 @@ def main() -> None:
                         name="cycle-sweep", daemon=True),
         threading.Thread(target=_cycle, args=("sync", rt.sync_interval,
                         _sync_and_renew), name="cycle-sync", daemon=True),
+        # 在途任务巡检：超时未回报的派发任务回收重派（消除静默丢失）
+        threading.Thread(target=_cycle, args=("inflight", 1.0,
+                        lambda: task_q.handle_event("CHECK_INFLIGHT", {})),
+                        name="cycle-inflight", daemon=True),
     ]
     for t in threads:
         t.start()
 
     try:
         while not stop_evt.is_set():
-            # 主控让位检测：若租约领导者已变为热备节点，则停止派发（防脑裂）
+            # 主控让位检测：若租约领导者已变为热备节点，则让位并暂停派发（防脑裂）
             leader = current_leader(rt.runtime_dir)
-            if leader and leader != "node_a" and not rt._health_fb.state.get("_demoted"):
-                rt._health_fb.state["_demoted"] = True
+            if leader and leader != "node_a" \
+                    and not failover_fb.state.get("demoted"):
+                failover_fb.state["demoted"] = True
+                task_q.state["paused"] = True
                 logger.error("检测到新领导者 %s，node_a 已让位（可重启为备用）", leader)
             time.sleep(1.0)
     except KeyboardInterrupt:

@@ -37,7 +37,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections import deque
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("function_block")
 
@@ -223,6 +224,11 @@ class ECC:
     def reset(self) -> None:
         """状态机复位到初始状态（热备接管/在线复位时使用）。"""
         self.current_state = self._initial_state
+
+    @property
+    def initial_state(self) -> str:
+        """构造时声明的初始状态名（供"是否空闲"判定等使用）。"""
+        return self._initial_state
 
 
 # ==============================================================================
@@ -448,7 +454,65 @@ class FunctionBlock:
 
 
 # ==============================================================================
-# 4. 示例功能块 + 模块自检
+# 4. 单容量执行功能块基类（忙碌排队，防并发任务被静默忽略）
+# ==============================================================================
+
+
+class QueuedExecutionFB(FunctionBlock):
+    """
+    单容量执行功能块基类：忙碌时把触发事件排队，而非任其被 ECC 静默忽略。
+
+    背景：ECC 型执行 FB 一次只处理一个任务（如搬运 Idle→Moving），第二个
+    并发触发事件因"无匹配迁移"被忽略（标准语义：无迁移则事件保持状态），
+    在任务派发语境下表现为"任务静默丢失、主控在途表永不回收"。
+
+    本基类提供 WIP=1 + 等待队列的容量控制：
+      - BUSY_TRIGGER_EVENTS 声明的触发事件到达且 FB 不空闲 -> 事件随行数据
+        进入内部 FIFO 等待队列（不丢失，等待当前任务完成后续跑）；
+      - 每次事件处理完毕（以及子类完成路径显式调用 _drain_pending）时，
+        若 FB 已回到空闲态且队列非空 -> 取队首事件重新触发。
+
+    子类可覆写 _is_idle() 定制"空闲"判定（无 ECC 的过程式 FB 需覆写，
+    如气缸以 position 处于两个止点之一为空闲）。
+    """
+
+    BUSY_TRIGGER_EVENTS: Tuple[str, ...] = ()   # 需要忙碌排队的触发事件名
+
+    def __init__(self, name: str, params: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(name, params)
+        self._pending_events: Deque[Tuple[str, Dict[str, Any]]] = deque()
+
+    # ------------------------------------------------------------ 容量控制
+    def _is_idle(self) -> bool:
+        """空闲判定：ECC 处于初始态（子类可覆写，如过程式 FB）。"""
+        return self.ecc is None or self.ecc.current_state == self.ecc.initial_state
+
+    def handle_event(self, event_name: str,
+                     data: Optional[Dict[str, Any]] = None) -> bool:
+        """忙碌时排队触发事件；空闲时照常处理，处理完尝试续跑队首。"""
+        with self._lock:
+            if event_name in self.BUSY_TRIGGER_EVENTS and not self._is_idle():
+                self._pending_events.append((event_name, dict(data or {})))
+                logger.warning("[%s] 忙碌中收到并发 %s（任务%s），已排队（积压%d）",
+                               self.name, event_name,
+                               (data or {}).get("task_id", "?"),
+                               len(self._pending_events))
+                return True
+            accepted = super().handle_event(event_name, data)
+        self._drain_pending()               # 锁外续跑，避免同锁深递归
+        return accepted
+
+    def _drain_pending(self) -> None:
+        """空闲且队列非空时取队首事件继续执行（完成路径也可显式调用）。"""
+        with self._lock:
+            if not (self._is_idle() and self._pending_events):
+                return
+            event_name, data = self._pending_events.popleft()
+        self.handle_event(event_name, data)
+
+
+# ==============================================================================
+# 5. 示例功能块 + 模块自检
 # ==============================================================================
 
 

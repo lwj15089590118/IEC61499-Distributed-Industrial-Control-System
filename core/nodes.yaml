@@ -90,6 +90,68 @@ nodes:
         params:
           standby_node: node_e
           requeue_on_worker_down: true
+    # 事件连接组态（binds：主题过滤器->FB事件输入；routes：FB事件输出->主题）。
+    # 动态主题路由（按任务目标节点派发）与结果过滤订阅仍由代码装配。
+    connections:
+      binds:
+        - topic: factory/orders
+          fb: order_manager
+          event: NEW_ORDER
+        - topic: factory/web/orders
+          fb: order_manager
+          event: NEW_ORDER
+        - topic: node_a/internal/order_split
+          fb: task_queue
+          event: ENQUEUE
+        - topic: factory/heartbeat/+
+          fb: health_monitor
+          event: BEAT
+        - topic: node_a/internal/node_offline
+          fb: task_queue
+          event: NODE_DOWN
+        - topic: node_a/internal/node_offline
+          fb: failover_ctrl
+          event: NODE_OFFLINE
+        - topic: node_a/internal/requeue
+          fb: task_queue
+          event: REQUEUE
+        - topic: node_a/internal/node_online
+          fb: task_queue
+          event: NODE_UP
+        - topic: factory/failover
+          fb: failover_ctrl
+          event: FAILOVER_DONE
+      routes:
+        - fb: order_manager
+          event: ORDER_SPLIT
+          topic: node_a/internal/order_split
+          event_type: ORDER_SPLIT
+          scope: local
+        - fb: task_queue
+          event: TASK_FAILED
+          topic: factory/alerts
+          event_type: ALERT
+          priority: HIGH
+        - fb: health_monitor
+          event: NODE_OFFLINE
+          topic: factory/alerts
+          event_type: NODE_OFFLINE
+          priority: CRITICAL
+        - fb: health_monitor
+          event: NODE_OFFLINE
+          topic: node_a/internal/node_offline
+          event_type: NODE_OFFLINE
+          scope: local
+        - fb: health_monitor
+          event: NODE_ONLINE
+          topic: node_a/internal/node_online
+          event_type: NODE_ONLINE
+          scope: local
+        - fb: failover_ctrl
+          event: REQUEUE
+          topic: node_a/internal/requeue
+          event_type: TASK_FAILED
+          scope: local
 
   # ============================ 节点B：机器人节点 ==============================
   # 职责：物料搬运、坐标系标定、轨迹规划（全部为模拟量输出）
@@ -126,6 +188,61 @@ nodes:
           max_velocity: 1200.0          # 最大速度 mm/s
           max_accel: 8000.0             # 最大加速度 mm/s^2
           blend_radius: 5.0             # 拐角过渡半径 mm
+    connections:
+      binds:
+        - topic: factory/tasks/node_b
+          fb: task_router
+          event: TASK
+        - topic: node_b/internal/carry
+          fb: handling
+          event: CARRY
+        - topic: node_b/internal/calibrate
+          fb: calibration
+          event: CALIBRATE
+        - topic: node_b/internal/plan
+          fb: trajectory
+          event: PLAN
+      routes:
+        - fb: task_router
+          event: CARRY_REQ
+          topic: node_b/internal/carry
+          scope: local
+        - fb: task_router
+          event: CALIB_REQ
+          topic: node_b/internal/calibrate
+          scope: local
+        - fb: task_router
+          event: PLAN_REQ
+          topic: node_b/internal/plan
+          scope: local
+        - fb: handling
+          event: TASK_STARTED
+          topic: factory/events
+          event_type: TASK_STARTED
+        - fb: handling
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
+        - fb: handling
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: calibration
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: trajectory
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: calibration
+          event: CALIBRATION_DONE
+          topic: factory/events
+          event_type: CALIBRATION_DONE
+        - fb: trajectory
+          event: TRAJECTORY_PLANNED
+          topic: factory/events
+          event_type: TRAJECTORY_PLANNED
 
   # ============================ 节点C：PLC节点 =================================
   # 职责：传送带控制、气缸伸缩、伺服定位（模拟传统PLC的IO控制）
@@ -163,6 +280,76 @@ nodes:
             max_rpm: 3000               # 最高转速
             pitch_mm: 5.0               # 丝杠导程
             positioning_tol: 0.02       # 定位容差 mm
+    connections:
+      binds:
+        - topic: factory/tasks/node_c
+          fb: task_router
+          event: TASK
+        - topic: node_c/internal/conveyor
+          fb: conveyor
+          event: RUN
+        - topic: node_c/internal/cyl_extend
+          fb: cylinder
+          event: EXTEND
+        - topic: node_c/internal/cyl_retract
+          fb: cylinder
+          event: RETRACT
+        - topic: node_c/internal/servo
+          fb: servo
+          event: POSITION
+      routes:
+        - fb: task_router
+          event: CONVEYOR_REQ
+          topic: node_c/internal/conveyor
+          scope: local
+        - fb: task_router
+          event: CYL_EXT_REQ
+          topic: node_c/internal/cyl_extend
+          scope: local
+        - fb: task_router
+          event: CYL_RET_REQ
+          topic: node_c/internal/cyl_retract
+          scope: local
+        - fb: task_router
+          event: SERVO_REQ
+          topic: node_c/internal/servo
+          scope: local
+        - fb: conveyor
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: cylinder
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: servo
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: conveyor
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
+        - fb: cylinder
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
+        - fb: servo
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
+        - fb: conveyor
+          event: CONVEYOR_STATUS
+          topic: factory/events
+          event_type: CONVEYOR_STATUS
+        - fb: cylinder
+          event: CYCLE_DONE
+          topic: factory/events
+          event_type: CYCLE_DONE
+        - fb: servo
+          event: SERVO_IN_POSITION
+          topic: factory/events
+          event_type: SERVO_IN_POSITION
 
   # ============================ 节点D：视觉节点 ================================
   # 职责：模拟图像采集、AI推理缺陷检测、结果回传主控
@@ -200,6 +387,49 @@ nodes:
         params:
           ng_threshold: 0.65            # 缺陷概率判定阈值（可在线调整）
           classes: [划痕, 凹陷, 污渍, 边缘破损]
+    connections:
+      binds:
+        - topic: factory/tasks/node_d
+          fb: task_router
+          event: TASK
+        - topic: node_d/internal/inspect
+          fb: camera
+          event: ACQUIRE
+        - topic: node_d/internal/captured
+          fb: inference
+          event: INFER
+        - topic: node_d/internal/inferred
+          fb: classifier
+          event: CLASSIFY
+      routes:
+        - fb: task_router
+          event: INSPECT_REQ
+          topic: node_d/internal/inspect
+          scope: local
+        - fb: camera
+          event: FRAME_READY
+          topic: node_d/internal/captured
+          scope: local
+        - fb: inference
+          event: INFER_DONE
+          topic: node_d/internal/inferred
+          scope: local
+        - fb: classifier
+          event: VISION_RESULT
+          topic: factory/vision/results
+          event_type: VISION_RESULT
+        - fb: classifier
+          event: TASK_COMPLETED
+          topic: factory/events
+          event_type: TASK_COMPLETED
+        - fb: camera
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
+        - fb: inference
+          event: TASK_PROGRESS
+          topic: factory/events
+          event_type: TASK_PROGRESS
 
   # ============================ 节点E：热备节点 ================================
   # 职责：监听主控心跳、复制任务队列状态、50ms 内完成热备接管
@@ -233,3 +463,19 @@ nodes:
         name: queue_replica
         params:
           replica_lag_ms: 100           # 允许的状态复制延迟
+    connections:
+      binds:
+        - topic: factory/heartbeat/node_a
+          fb: standby_monitor
+          event: BEAT
+      routes:
+        - fb: standby_monitor
+          event: FAILOVER_TRIGGERED
+          topic: factory/failover
+          event_type: FAILOVER_TRIGGERED
+          priority: CRITICAL
+        - fb: standby_monitor
+          event: ALERT_EVT
+          topic: factory/alerts
+          event_type: ALERT
+          priority: HIGH

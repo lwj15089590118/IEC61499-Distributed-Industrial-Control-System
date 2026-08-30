@@ -32,9 +32,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from communication.message_types import EventType, Topics  # noqa: E402
-from core.distributed_runtime import DistributedRuntime, configure_logger  # noqa: E402
+from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
+                                      configure_logger)
 from core.function_block import (DataPort, ECC, ECCState, ECCTransition,  # noqa: E402
-                                 EventPort, FunctionBlock)
+                                 EventPort, FunctionBlock, QueuedExecutionFB)
 
 logger = logging.getLogger("node_c")
 
@@ -104,7 +105,7 @@ class TaskRouterFB(FunctionBlock):
 # ==============================================================================
 
 
-class ConveyorControlFB(FunctionBlock):
+class ConveyorControlFB(QueuedExecutionFB):
     """
     传送带控制功能块。
 
@@ -112,7 +113,11 @@ class ConveyorControlFB(FunctionBlock):
       - RUN 事件启动皮带：记录启动时刻与速度（经软启动斜坡折算等效平均速度）；
       - 任意时刻查询位置：pos = last_pos + v_eff * elapsed（换向时重算基准）；
       - 停止/到位由定时线程注入 STOPPED 内部事件（等价定时器中断）。
+
+    容量控制（WIP=1）：单条皮带，运转中的并发 RUN 请求进入等待队列。
     """
+
+    BUSY_TRIGGER_EVENTS = ("RUN",)
 
     EVENT_INPUTS = [
         EventPort("RUN", with_inputs=["task_id", "duration", "speed"],
@@ -227,7 +232,7 @@ class ConveyorControlFB(FunctionBlock):
 # ==============================================================================
 
 
-class CylinderControlFB(FunctionBlock):
+class CylinderControlFB(QueuedExecutionFB):
     """
     双作用气缸控制功能块（过程式风格，演示两种建模方式并存）。
 
@@ -236,7 +241,12 @@ class CylinderControlFB(FunctionBlock):
     行为：
       EXTEND/RETRACT 事件得电 -> 电磁阀换向 -> 行程时间后磁性开关动作
       （带防抖）-> 发出 CYCLE_DONE 与 TASK_COMPLETED。
+
+    容量控制（WIP=1）：机械互锁由"忙碌排队"实现——动作中的新指令
+    进入等待队列而非被丢弃，行程到位后自动续跑（_drain_pending）。
     """
+
+    BUSY_TRIGGER_EVENTS = ("EXTEND", "RETRACT")
 
     EVENT_INPUTS = [
         EventPort("EXTEND", with_inputs=["task_id"], comment="伸出请求"),
@@ -264,15 +274,16 @@ class CylinderControlFB(FunctionBlock):
         self.state["cycles"] = 0
         self.state["position"] = "retracted"     # retracted / extending / ...
 
+    def _is_idle(self) -> bool:
+        """过程式 FB 的空闲判定：活塞处于两个止点之一（无 ECC）。"""
+        return self.state["position"] in ("retracted", "extended")
+
     def execute(self, event_name: str) -> None:
         if event_name not in ("EXTEND", "RETRACT"):
             return
         task = str(self.di["task_id"] or "CYL")
         direction = "extend" if event_name == "EXTEND" else "retract"
-        # 机械互锁：正在动作中时拒绝新指令（真实气阀的联锁逻辑）
-        if self.state["position"] not in ("retracted", "extended"):
-            logger.warning("气缸动作中，忽略 %s 请求（任务%s）", direction, task)
-            return
+        # 机械互锁（忙碌排队已保证到达此处时活塞处于止点）
         self.state["position"] = "extending" if direction == "extend" else "retracting"
         logger.info("气缸%s开始（任务%s，行程%.0fms）",
                     "伸出" if direction == "extend" else "缩回",
@@ -297,6 +308,7 @@ class CylinderControlFB(FunctionBlock):
                                  "b1": self.do["b1"], "b2": self.do["b2"]})
         self.emit("TASK_COMPLETED", {"task_id": task, "action": action,
                                      "node": "node_c"})
+        self._drain_pending()                    # 到位后续跑排队中的动作
 
 
 # ==============================================================================
@@ -304,7 +316,7 @@ class CylinderControlFB(FunctionBlock):
 # ==============================================================================
 
 
-class ServoPositionFB(FunctionBlock):
+class ServoPositionFB(QueuedExecutionFB):
     """
     伺服电机定位功能块（丝杠直线轴）。
 
@@ -312,7 +324,11 @@ class ServoPositionFB(FunctionBlock):
       - 最大线速度 v = max_rpm/60 * pitch_mm；
       - 梯形速度曲线运动到 target_mm，结束后叠加 ±0.005mm 随机重复定位误差；
       - |误差| <= positioning_tol 时报 SERVO_IN_POSITION，否则重定位一次。
+
+    容量控制（WIP=1）：单轴，运动/整定中的并发 POSITION 请求进入等待队列。
     """
+
+    BUSY_TRIGGER_EVENTS = ("POSITION",)
 
     EVENT_INPUTS = [
         EventPort("POSITION", with_inputs=["task_id", "target_mm"],
@@ -423,6 +439,20 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt = DistributedRuntime("node_c", config_path=config_path)
     router, conveyor, cylinder, servo = rt.autoload_fbs(FB_REGISTRY)
 
+    # ---- 事件连接：优先 nodes.yaml connections 组态；缺省回退硬编码 ----
+    fb_index = {"task_router": router, "conveyor": conveyor,
+                "cylinder": cylinder, "servo": servo}
+    conns = rt.node_cfg.get("connections")
+    if conns:
+        apply_connections(rt, conns, fb_index)
+    else:
+        _wire_node_c(rt, router, conveyor, cylinder, servo)
+    return rt
+
+
+def _wire_node_c(rt: DistributedRuntime, router, conveyor, cylinder,
+                 servo) -> None:
+    """硬编码事件连接（nodes.yaml 无 connections 段时的缺省回退）。"""
     rt.bind_input(Topics.tasks_of("node_c"), router, "TASK")
     rt.route_output(router, "CONVEYOR_REQ", T_CONVEYOR, scope="local")
     rt.route_output(router, "CYL_EXT_REQ", T_CYL_EXT, scope="local")
@@ -442,7 +472,6 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt.route_output(cylinder, "CYCLE_DONE", Topics.EVENTS, EventType.CYCLE_DONE)
     rt.route_output(servo, "SERVO_IN_POSITION", Topics.EVENTS,
                     EventType.SERVO_IN_POSITION)
-    return rt
 
 
 def main() -> None:

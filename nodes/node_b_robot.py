@@ -32,9 +32,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from communication.message_types import EventType, Priority, Topics  # noqa: E402
-from core.distributed_runtime import DistributedRuntime, configure_logger  # noqa: E402
+from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
+                                      configure_logger)
 from core.function_block import (DataPort, ECC, ECCState, ECCTransition,  # noqa: E402
-                                 EventPort, FunctionBlock)
+                                 EventPort, FunctionBlock, QueuedExecutionFB)
 
 logger = logging.getLogger("node_b")
 
@@ -110,7 +111,7 @@ class TaskRouterFB(FunctionBlock):
 # ==============================================================================
 
 
-class MaterialHandlingFB(FunctionBlock):
+class MaterialHandlingFB(QueuedExecutionFB):
     """
     物料搬运功能块 —— ECC 演示核心。
 
@@ -120,9 +121,14 @@ class MaterialHandlingFB(FunctionBlock):
     注入（对应真实机器人控制器的运动完成中断），充分体现事件驱动：
     FB 的推进完全由事件触发，而非轮询查询。
 
+    容量控制（WIP=1）：机器人单工位，Busy 时并发 CARRY 进入等待队列
+    （QueuedExecutionFB），避免第二个任务被 ECC 静默忽略而永久丢失。
+
     对外事件：
       CARRY(入)  TASK_STARTED / TASK_PROGRESS / TASK_COMPLETED(出)
     """
+
+    BUSY_TRIGGER_EVENTS = ("CARRY",)
 
     EVENT_INPUTS = [
         EventPort("CARRY", with_inputs=["task_id", "from", "to", "params"],
@@ -413,6 +419,20 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt = DistributedRuntime("node_b", config_path=config_path)
     router, handling, calib, planner = rt.autoload_fbs(FB_REGISTRY)
 
+    # ---- 事件连接：优先 nodes.yaml connections 组态；缺省回退硬编码 ----
+    fb_index = {"task_router": router, "handling": handling,
+                "calibration": calib, "trajectory": planner}
+    conns = rt.node_cfg.get("connections")
+    if conns:
+        apply_connections(rt, conns, fb_index)
+    else:
+        _wire_node_b(rt, router, handling, calib, planner)
+    return rt
+
+
+def _wire_node_b(rt: DistributedRuntime, router, handling, calib,
+                 planner) -> None:
+    """硬编码事件连接（nodes.yaml 无 connections 段时的缺省回退）。"""
     # 主控任务派发 -> 路由FB
     rt.bind_input(Topics.tasks_of("node_b"), router, "TASK")
     # 路由FB -> 各执行FB（节点内互连）
@@ -435,7 +455,6 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
                     EventType.CALIBRATION_DONE)
     rt.route_output(planner, "TRAJECTORY_PLANNED", Topics.EVENTS,
                     EventType.TRAJECTORY_PLANNED)
-    return rt
 
 
 def main() -> None:

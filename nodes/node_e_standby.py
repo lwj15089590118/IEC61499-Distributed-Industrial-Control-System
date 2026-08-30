@@ -34,8 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from communication.message_types import EventType, Priority, Topics  # noqa: E402
-from core.distributed_runtime import (DistributedRuntime, configure_logger,  # noqa: E402
-                                      try_acquire_leader, current_leader)
+from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
+                                      configure_logger, current_leader,
+                                      read_leader_lease, try_acquire_leader)
 from core.function_block import DataPort, EventPort, FunctionBlock  # noqa: E402
 
 logger = logging.getLogger("node_e")
@@ -50,7 +51,13 @@ class TaskQueueReplicaFB(FunctionBlock):
     """
     任务队列副本：接收主控 STATE_SYNC 快照并重建本地队列。
 
-    接管后本副本直接作为派发数据源，实现"无逢"续跑。
+    接收侧双重门控（防旧主控快照回灌覆盖活队列 —— P0）：
+      1) 发送方必须"当前"持有领导者租约（宕机/让位/失租的旧主控被拒）；
+      2) 快照纪元不小于本地已见最大纪元（严格过期的快照被拒）。
+    接管后本副本直接作为派发数据源，实现"无缝"续跑。
+
+    线程安全：副本堆的全部读写（快照应用/派发泵/接管态直收订单）
+    都经 FB 互斥锁（handle_event / enqueue_tasks）串行化。
     """
 
     EVENT_INPUTS = [
@@ -78,7 +85,10 @@ class TaskQueueReplicaFB(FunctionBlock):
         super().__init__(name, params)
         self._heap: List[tuple] = []                    # (priority, seq, task)
         self._seq = itertools.count(1)
+        # 运行时引用由装配代码注入（读取领导者租约做快照来源校验）
+        self.runtime_ref: Optional[DistributedRuntime] = None
         self.state["master_epoch"] = 0
+        self.state["max_seen_epoch"] = 0                # 本地已见最大纪元
         self.state["last_sync_ts"] = 0.0
         self.state["completed"] = 0
         self.state["dispatched"] = 0
@@ -94,14 +104,25 @@ class TaskQueueReplicaFB(FunctionBlock):
         """全量覆盖式复制（快照同步简单可靠，避免增量差异合并的复杂性）。"""
         tasks: List[Dict] = self.di["queue"] or []
         epoch = int(self.di["epoch"] or 0)
-        # 只接受更新纪元的快照，防止旧主控复活后的过期状态回灌
-        if epoch < self.state["master_epoch"]:
+        sender = str(self.state.get("_ext_source", ""))
+        # 门控一：只接受不早于本地已见最大纪元的快照（过期快照直接拒绝）
+        if epoch < int(self.state["max_seen_epoch"]):
             logger.warning("忽略过期纪元快照 epoch=%d < %d",
-                           epoch, self.state["master_epoch"])
+                           epoch, self.state["max_seen_epoch"])
+            return
+        # 门控二：发送方必须是"当前"租约领导者（宕机/让位的旧主控被拒）
+        lease = (read_leader_lease(self.runtime_ref.runtime_dir)
+                 if self.runtime_ref else None)
+        if lease is None or not sender or lease.get("leader") != sender:
+            logger.warning("拒绝非当前领导者的快照 source=%s 租约领导者=%s epoch=%d",
+                           sender or "?",
+                           (lease or {}).get("leader", "<无有效租约>"), epoch)
             return
         self._heap = [(int(t.get("priority", 2)), next(self._seq), t)
                       for t in tasks]
         heapq.heapify(self._heap)
+        self.state["max_seen_epoch"] = max(int(self.state["max_seen_epoch"]),
+                                           epoch)
         self.state["master_epoch"] = epoch
         self.state["last_sync_ts"] = time.time()
         self.state["completed"] = int(self.state.get("_ext_completed", 0))
@@ -118,9 +139,19 @@ class TaskQueueReplicaFB(FunctionBlock):
         self.do["replicated"] = len(self._heap)
         self.emit("TASK_DISPATCHED", dict(task))
 
+    def enqueue_tasks(self, tasks: List[Dict]) -> None:
+        """接管态直收新订单：加锁入堆（与快照复制/派发泵线程互斥）。"""
+        with self._lock:
+            for task in tasks:
+                self._heap.append((int(task.get("priority", 2)),
+                                   next(self._seq), task))
+            heapq.heapify(self._heap)
+            self.do["replicated"] = len(self._heap)
+
     def pending_count(self) -> int:
         """当前副本中的待派发任务数。"""
-        return len(self._heap)
+        with self._lock:
+            return len(self._heap)
 
 
 # ==============================================================================
@@ -264,27 +295,35 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt = DistributedRuntime("node_e", config_path=config_path)
     monitor, replica = rt.autoload_fbs(FB_REGISTRY)
 
-    # 组件互相引用（切换动作需要）
+    # 组件互相引用（切换动作需要；副本读租约做快照来源校验）
     monitor.runtime_ref = rt
     monitor.replica = replica
+    replica.runtime_ref = rt
 
-    # ---- 主控心跳监听（双通道都会汇入总线，这里只管订阅主题）----
-    rt.bind_input(Topics.heartbeat_of("node_a"), monitor, "BEAT")
+    # ---- 事件连接：优先 nodes.yaml connections 组态；缺省回退硬编码 ----
+    # （快照复制走"注入来源身份"的定制订阅、动态派发路由与订单直收，
+    #   这些无法用通用组态表达，见下方"公共装配"）
+    fb_index = {"standby_monitor": monitor, "queue_replica": replica}
+    conns = rt.node_cfg.get("connections")
+    if conns:
+        apply_connections(rt, conns, fb_index)
+    else:
+        _wire_node_e(rt, monitor)
 
-    # ---- 状态快照复制 ----
-    rt.bind_input(Topics.sync_of("node_a"), replica, "APPLY_SYNC")
+    # ---- 公共装配 ----
+    # 状态快照复制：经定制订阅注入"来源节点身份"，
+    # 副本据此校验"发送方当前持有租约"（P0 防旧主控快照回灌）。
+    def _on_state_sync(msg) -> None:
+        replica.handle_event("APPLY_SYNC", dict(msg.payload,
+                                                source=msg.source))
+    rt.bus.subscribe(Topics.sync_of("node_a"), _on_state_sync,
+                     name="standby-state-sync")
 
     # ---- 接管后：副本队列任务 -> 按目标节点派发（带新 epoch）----
     rt.route_output(replica, "TASK_DISPATCHED",
                     topic=lambda data: Topics.tasks_of(data.get("target_node",
                                                                 "unknown")),
                     event_type=EventType.TASK_DISPATCHED)
-
-    # ---- 切换通告：全局 CRITICAL ----
-    rt.route_output(monitor, "FAILOVER_TRIGGERED", Topics.FAILOVER,
-                    EventType.FAILOVER_TRIGGERED, priority=Priority.CRITICAL)
-    rt.route_output(monitor, "ALERT_EVT", Topics.ALERTS, EventType.ALERT,
-                    priority=Priority.HIGH)
 
     # ---- 接管后接收新订单：直接进入副本队列 ----
     # 复用 OrderManager 不引入循环依赖的做法：节点E实现一个轻量直通逻辑
@@ -294,17 +333,19 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
         if monitor.state["mode"] != "active":
             return
         payload = msg.payload
+        tasks = []
         for i in range(int(payload.get("quantity", 1))):
             for seq, (action, node) in enumerate((("CARRY", "node_b"),
                                                   ("INSPECT", "node_d"))):
-                replica._heap.append((2, next(replica._seq), {
+                tasks.append({
                     "task_id": "E-%s-%d-%d" % (payload.get("order_id", "ORD"),
                                                i, seq),
                     "order_id": payload.get("order_id", ""),
                     "action": action, "target_node": node,
                     "params": {"product": payload.get("product", "")},
-                    "priority": 2, "attempts": 0}))
-        heapq.heapify(replica._heap)
+                    "priority": 2, "attempts": 0})
+        # 加锁入堆（原实现跨线程裸改 _heap，与派发泵存在并发竞争）
+        replica.enqueue_tasks(tasks)
         logger.info("接管态收到订单 %s，副本队列 +%d 任务",
                     payload.get("order_id", "?"),
                     int(payload.get("quantity", 1)) * 2)
@@ -313,6 +354,18 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt.bus.subscribe(Topics.WEB_ORDERS, _order_intake,
                      name="standby-web-order-intake")
     return rt
+
+
+def _wire_node_e(rt: DistributedRuntime, monitor) -> None:
+    """硬编码事件连接（nodes.yaml 无 connections 段时的缺省回退）。"""
+    # ---- 主控心跳监听（双通道都会汇入总线，这里只管订阅主题）----
+    rt.bind_input(Topics.heartbeat_of("node_a"), monitor, "BEAT")
+
+    # ---- 切换通告：全局 CRITICAL ----
+    rt.route_output(monitor, "FAILOVER_TRIGGERED", Topics.FAILOVER,
+                    EventType.FAILOVER_TRIGGERED, priority=Priority.CRITICAL)
+    rt.route_output(monitor, "ALERT_EVT", Topics.ALERTS, EventType.ALERT,
+                    priority=Priority.HIGH)
 
 
 def main() -> None:

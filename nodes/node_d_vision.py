@@ -30,9 +30,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from communication.message_types import EventType, Topics  # noqa: E402
-from core.distributed_runtime import DistributedRuntime, configure_logger  # noqa: E402
+from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
+                                      configure_logger)
 from core.function_block import (DataPort, ECC, ECCState, ECCTransition,  # noqa: E402
-                                 EventPort, FunctionBlock)
+                                 EventPort, FunctionBlock, QueuedExecutionFB)
 
 logger = logging.getLogger("node_d")
 
@@ -86,14 +87,19 @@ class TaskRouterFB(FunctionBlock):
 # ==============================================================================
 
 
-class ImageAcquisitionFB(FunctionBlock):
+class ImageAcquisitionFB(QueuedExecutionFB):
     """
     图像采集功能块（模拟工业相机）。
 
     行为：
       ACQUIRE 事件 -> 模拟曝光/传输时延 -> 生成帧元数据（帧号/亮度/噪声）
       -> 发出 FRAME_READY，触发下游推理。
+
+    容量控制（WIP=1）：单相机，曝光中的并发 ACQUIRE 进入等待队列，
+    防止并发检测任务被 ECC 静默忽略（任务静默丢失）。
     """
+
+    BUSY_TRIGGER_EVENTS = ("ACQUIRE",)
 
     EVENT_INPUTS = [
         EventPort("ACQUIRE", with_inputs=["task_id", "params"], comment="采图请求"),
@@ -161,7 +167,7 @@ class ImageAcquisitionFB(FunctionBlock):
 # ==============================================================================
 
 
-class AIInferenceFB(FunctionBlock):
+class AIInferenceFB(QueuedExecutionFB):
     """
     AI推理功能块（模拟缺陷检测CNN）。
 
@@ -169,7 +175,11 @@ class AIInferenceFB(FunctionBlock):
       INFER 事件（随行 frame_id/quality）-> 模拟 GPU 推理时延
       -> 按缺陷先验分布采样真实类别 -> 生成与类别相关的置信度
       -> 发出 INFER_DONE（置信度 + 候选类别）。
+
+    容量控制（WIP=1）：单推理单元，推理中的并发 INFER 进入等待队列。
     """
+
+    BUSY_TRIGGER_EVENTS = ("INFER",)
 
     EVENT_INPUTS = [
         EventPort("INFER", with_inputs=["task_id", "frame_id", "quality"],
@@ -338,6 +348,20 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
     rt = DistributedRuntime("node_d", config_path=config_path)
     router, camera, infer, classifier = rt.autoload_fbs(FB_REGISTRY)
 
+    # ---- 事件连接：优先 nodes.yaml connections 组态；缺省回退硬编码 ----
+    fb_index = {"task_router": router, "camera": camera,
+                "inference": infer, "classifier": classifier}
+    conns = rt.node_cfg.get("connections")
+    if conns:
+        apply_connections(rt, conns, fb_index)
+    else:
+        _wire_node_d(rt, router, camera, infer, classifier)
+    return rt
+
+
+def _wire_node_d(rt: DistributedRuntime, router, camera, infer,
+                 classifier) -> None:
+    """硬编码事件连接（nodes.yaml 无 connections 段时的缺省回退）。"""
     # 任务入口 -> 检测流水线
     rt.bind_input(Topics.tasks_of("node_d"), router, "TASK")
     rt.route_output(router, "INSPECT_REQ", T_INSPECT, scope="local")
@@ -356,7 +380,6 @@ def build_runtime(config_path: Optional[str] = None) -> DistributedRuntime:
                     EventType.TASK_COMPLETED)
     rt.route_output(camera, "TASK_PROGRESS", Topics.EVENTS, EventType.TASK_PROGRESS)
     rt.route_output(infer, "TASK_PROGRESS", Topics.EVENTS, EventType.TASK_PROGRESS)
-    return rt
 
 
 def main() -> None:
