@@ -37,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from communication.message_types import EventType, Priority, Topics  # noqa: E402
 from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
                                       configure_logger, current_leader,
-                                      try_acquire_leader)
+                                      guarded_cycle, try_acquire_leader)
 from core.function_block import (DataPort, ECC, ECCState, ECCTransition,  # noqa: E402
                                  EventPort, FunctionBlock)
 
@@ -649,21 +649,16 @@ def _wire_node_a(rt: DistributedRuntime, order_mgr, task_q, health,
     rt.bind_input("factory/web/orders", order_mgr, "NEW_ORDER")   # Web手动下单
 
 
-def main() -> None:
-    """节点A主程序：装配 -> 启动 -> 周期性(定时器事件)巡检/同步/续租。"""
-    configure_logger("node_a")
-    rt = build_runtime()
-    rt.start()
-    logger.info("========== 主控节点 node_a 已启动 ==========")
+def spawn_cycle_threads(rt: DistributedRuntime, stop_evt: threading.Event,
+                        backoff_s: float = 1.0) -> List[threading.Thread]:
+    """
+    构造 node_a 的全部 E_CYCLE 周期线程（健康巡检/同步续租/在途巡检）。
 
-    stop_evt = threading.Event()
-
-    def _cycle(name: str, interval: float, fn) -> None:
-        """E_CYCLE 风格定时器线程：周期性注入事件（事件驱动的定时源）。"""
-        while not stop_evt.is_set():
-            fn()
-            stop_evt.wait(interval)
-
+    三条线程统一经 guarded_cycle 防护（复审报告10 N1）：FileLock/底层IO
+    的单次异常退避重试不致命，连续异常升级告警，达上限留下"线程已死"
+    日志与状态标记后退出——杜绝"一次异常杀死续租/巡检线程 -> 静默降级/
+    任务永久滞留"。backoff_s 供测试缩短退避（生产默认 1s）。
+    """
     # 1) 健康巡检（500ms 注入一次 SWEEP 事件 —— 仍是事件驱动而非循环扫描FB）
     health = rt._health_fb
 
@@ -703,17 +698,34 @@ def main() -> None:
         }, priority=Priority.HIGH)
 
     threads = [
-        threading.Thread(target=_cycle, args=("sweep", 0.5,
-                        lambda: health.handle_event("SWEEP", {})),
-                        name="cycle-sweep", daemon=True),
-        threading.Thread(target=_cycle, args=("sync", rt.sync_interval,
-                        _sync_and_renew), name="cycle-sync", daemon=True),
-        # 在途任务巡检：超时未回报的派发任务回收重派（消除静默丢失）
-        threading.Thread(target=_cycle, args=("inflight", 1.0,
-                        lambda: task_q.handle_event("CHECK_INFLIGHT", {})),
-                        name="cycle-inflight", daemon=True),
+        threading.Thread(target=guarded_cycle,
+                         args=(stop_evt, 0.5,
+                               lambda: health.handle_event("SWEEP", {})),
+                         kwargs={"backoff_s": backoff_s},
+                         name="cycle-sweep", daemon=True),
+        threading.Thread(target=guarded_cycle,
+                         args=(stop_evt, rt.sync_interval, _sync_and_renew),
+                         kwargs={"backoff_s": backoff_s},
+                         name="cycle-sync", daemon=True),
+        # 3) 在途任务巡检：超时未回报的派发任务回收重派（消除静默丢失）
+        threading.Thread(target=guarded_cycle,
+                         args=(stop_evt, 1.0,
+                               lambda: task_q.handle_event("CHECK_INFLIGHT", {})),
+                         kwargs={"backoff_s": backoff_s},
+                         name="cycle-inflight", daemon=True),
     ]
-    for t in threads:
+    return threads
+
+
+def main() -> None:
+    """节点A主程序：装配 -> 启动 -> 周期性(定时器事件)巡检/同步/续租。"""
+    configure_logger("node_a")
+    rt = build_runtime()
+    rt.start()
+    logger.info("========== 主控节点 node_a 已启动 ==========")
+
+    stop_evt = threading.Event()
+    for t in spawn_cycle_threads(rt, stop_evt):
         t.start()
 
     try:

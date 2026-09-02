@@ -36,7 +36,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from communication.message_types import EventType, Priority, Topics  # noqa: E402
 from core.distributed_runtime import (DistributedRuntime, apply_connections,  # noqa: E402
                                       configure_logger, current_leader,
-                                      read_leader_lease, try_acquire_leader)
+                                      guarded_cycle, read_leader_lease,
+                                      try_acquire_leader)
 from core.function_block import DataPort, EventPort, FunctionBlock  # noqa: E402
 
 logger = logging.getLogger("node_e")
@@ -368,6 +369,34 @@ def _wire_node_e(rt: DistributedRuntime, monitor) -> None:
                     priority=Priority.HIGH)
 
 
+def spawn_cycle_threads(rt: DistributedRuntime, stop_evt: threading.Event,
+                        backoff_s: float = 1.0) -> List[threading.Thread]:
+    """
+    构造 node_e 的全部 E_CYCLE 周期线程（失联检测巡检/接管派发泵）。
+
+    派发泵（pump）是接管态唯一的续租与派发驱动：原裸循环下 FileLock/IO
+    一次异常即杀死线程——租约 2s 过期后 node_a 已被 demoted 闩锁锁死
+    不会接管，集群进入"无领导者、无派发"的静默停滞（复审报告10 N1 最
+    危险场景）。现统一经 guarded_cycle 防护：单次异常退避重试、连续
+    异常升级告警、达上限留下"线程已死"日志与状态标记后退出。
+    backoff_s 供测试缩短退避（生产默认 1s）。
+    """
+    monitor = rt.get_fb("standby_monitor")
+    return [
+        # 失联检测巡检：100ms 粒度（检测窗口 = timeout + 0~100ms）
+        threading.Thread(target=guarded_cycle,
+                         args=(stop_evt, 0.1,
+                               lambda: monitor.handle_event("SWEEP", {})),
+                         kwargs={"backoff_s": backoff_s},
+                         name="sweep", daemon=True),
+        # 接管后的派发泵：500ms 一轮（热备态下 pump_dispatch 直接返回）
+        threading.Thread(target=guarded_cycle,
+                         args=(stop_evt, 0.5, monitor.pump_dispatch),
+                         kwargs={"backoff_s": backoff_s},
+                         name="pump", daemon=True),
+    ]
+
+
 def main() -> None:
     """节点E主程序：热备待命 -> 巡检（100ms粒度）-> 必要时接管并派发。"""
     configure_logger("node_e")
@@ -378,22 +407,7 @@ def main() -> None:
     logger.info("========== 热备节点 node_e 已启动（等待主控心跳）==========")
 
     stop_evt = threading.Event()
-
-    def _cycle(name: str, interval: float, fn) -> None:
-        while not stop_evt.is_set():
-            fn()
-            stop_evt.wait(interval)
-
-    threads = [
-        # 失联检测巡检：100ms 粒度（检测窗口 = timeout + 0~100ms）
-        threading.Thread(target=_cycle, args=("sweep", 0.1,
-                        lambda: monitor.handle_event("SWEEP", {})),
-                        name="sweep", daemon=True),
-        # 接管后的派发泵：500ms 一轮（热备态下 pump_dispatch 直接返回）
-        threading.Thread(target=_cycle, args=("pump", 0.5,
-                        monitor.pump_dispatch), name="pump", daemon=True),
-    ]
-    for t in threads:
+    for t in spawn_cycle_threads(rt, stop_evt):
         t.start()
 
     try:

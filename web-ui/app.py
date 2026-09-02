@@ -35,8 +35,8 @@ from flask import Flask, jsonify, render_template, request  # noqa: E402
 from communication.message_types import (EventType, Message, Priority,  # noqa: E402
                                          Topics, make_message)
 from core.distributed_runtime import (RUNTIME_DIR, SharedMemoryChannel,  # noqa: E402
-                                      current_leader, load_config,
-                                      read_all_status)
+                                      current_leader, guarded_cycle,
+                                      load_config, read_all_status)
 
 logger = logging.getLogger("web_ui")
 
@@ -69,28 +69,31 @@ def init_backend(config_path: Optional[str] = None) -> None:
 
     # 后台线程：tail 共享事件流，填充事件缓冲与速率窗口
     def _tail_events() -> None:
+        """事件流 tail 线程（经 guarded_cycle 统一防护，复审报告10 N1）：
+        读取异常退避重试，连续异常升级告警并留死亡标记——原实现只捕
+        OSError，其余异常会静默杀死线程导致事件流/Web 面板停更。"""
         last_scan = 0.0
-        while True:
-            try:
-                messages = SharedMemoryChannel.read_journal(RUNTIME_DIR, limit=800)
-                new_idx = 0
-                with _BUFFER_LOCK:
-                    if _EVENT_BUFFER:
-                        last_id = _EVENT_BUFFER[-1].msg_id
-                        for i, m in enumerate(messages):
-                            if m.msg_id == last_id:
-                                new_idx = i + 1
-                                break
-                        else:
-                            new_idx = 0
-                    fresh = messages[new_idx:]
-                    _EVENT_BUFFER.extend(fresh)
-                if fresh and time.time() - last_scan >= 1.0:
-                    last_scan = time.time()
-                    _push_rate_bucket(fresh)
-            except OSError as exc:
-                logger.error("事件流读取异常: %s", exc)
-            time.sleep(1.0)
+
+        def _tick() -> None:
+            nonlocal last_scan
+            messages = SharedMemoryChannel.read_journal(RUNTIME_DIR, limit=800)
+            new_idx = 0
+            with _BUFFER_LOCK:
+                if _EVENT_BUFFER:
+                    last_id = _EVENT_BUFFER[-1].msg_id
+                    for i, m in enumerate(messages):
+                        if m.msg_id == last_id:
+                            new_idx = i + 1
+                            break
+                    else:
+                        new_idx = 0
+                fresh = messages[new_idx:]
+                _EVENT_BUFFER.extend(fresh)
+            if fresh and time.time() - last_scan >= 1.0:
+                last_scan = time.time()
+                _push_rate_bucket(fresh)
+
+        guarded_cycle(None, 1.0, _tick, name="event-tail")
 
     threading.Thread(target=_tail_events, daemon=True, name="event-tail").start()
 

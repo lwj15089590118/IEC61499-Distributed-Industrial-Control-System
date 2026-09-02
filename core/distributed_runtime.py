@@ -87,6 +87,110 @@ def configure_logger(name: str, level: str = "INFO") -> None:
 
 
 # ==============================================================================
+# 0.5 周期线程统一防护（复审报告10 N1：定时线程一次异常即静默死亡）
+# ==============================================================================
+
+_cycle_guard_lock = threading.Lock()
+# "线程已死"状态标记：线程名 -> 死因摘要（进程内可见；经
+# DistributedRuntime.snapshot_status 写入状态槽 dead_threads 字段，
+# 供 Web 控制台与运维发现——线程即便自杀也绝不静默）
+_dead_cycle_threads: Dict[str, str] = {}
+
+
+def mark_cycle_thread_dead(name: str, reason: str) -> None:
+    """记录"周期线程已死"状态标记（线程退出前的最后防线）。"""
+    with _cycle_guard_lock:
+        _dead_cycle_threads[name] = reason
+
+
+def dead_cycle_threads() -> Dict[str, str]:
+    """当前进程内已死亡的周期线程快照（线程名 -> 死因摘要）。"""
+    with _cycle_guard_lock:
+        return dict(_dead_cycle_threads)
+
+
+def reset_cycle_thread_guard() -> None:
+    """清空死亡标记（仅供测试隔离使用）。"""
+    with _cycle_guard_lock:
+        _dead_cycle_threads.clear()
+
+
+def _cycle_wait(stop_evt: Optional[threading.Event], seconds: float) -> None:
+    """等待一段时间；stop_evt 置位时立即返回（stop_evt 为 None 时常驻）。"""
+    if stop_evt is None:
+        time.sleep(seconds)
+    else:
+        stop_evt.wait(seconds)
+
+
+def guarded_cycle(stop_evt: Optional[threading.Event], interval: float,
+                  fn: Callable[[], None], name: str = "",
+                  backoff_s: float = 1.0, max_consecutive: int = 10,
+                  escalation_after: int = 3,
+                  on_death: Optional[Callable[[str, str], None]] = None) -> None:
+    """
+    E_CYCLE 风格周期线程的统一防护包装（全部长生命周期定时线程共用，
+    避免逐处复制粘贴 try/except）。
+
+    原实现的 `while: fn(); wait(interval)` 裸循环存在致命缺陷：fn 链路中
+    FileLock 超时/底层 IO 的一次异常即永久杀死线程且无任何日志——例如
+    node_e 派发泵死亡后租约 2s 过期、旧主控已让位，集群进入"无领导者、
+    无派发"的静默停滞（复审报告10 N1）。本包装的三级响应：
+
+      1. 单次异常不致命：记录含线程名与完整堆栈的 ERROR 日志，退避
+         backoff_s 秒后继续下一拍（正常拍间隔照旧）；
+      2. 连续异常升级：连续 escalation_after 次起每拍追加 WARNING
+         升级告警，把"持续性故障"从 ERROR 洪流中凸显出来；
+      3. 连续 max_consecutive（默认10）次异常：判定线程不可自愈，
+         留下 CRITICAL"线程已死"日志 + mark_cycle_thread_dead 死亡
+         状态标记后退出循环——自杀也必须"有声"，供运维/状态槽发现。
+
+    参数：
+      stop_evt         停止事件（None 表示常驻随进程退出）；
+      interval         正常拍间隔（经 stop_evt.wait 实现，置位即及时退出）；
+      fn               单拍执行体（异常由本包装兜底）；
+      name             线程名（缺省取 current_thread().name，用于日志/标记）；
+      backoff_s        异常后退避时长（测试可调小）；
+      max_consecutive  连续异常自杀阈值；
+      escalation_after 连续异常升级告警起点（须 < max_consecutive）；
+      on_death         自杀前的附加回调 (线程名, 死因)，异常不影响主流程。
+    """
+    tname = name or threading.current_thread().name
+    consecutive = 0
+    while stop_evt is None or not stop_evt.is_set():
+        try:
+            fn()
+            consecutive = 0                        # 成功一拍即重置连续计数
+            _cycle_wait(stop_evt, interval)
+        except Exception as exc:  # noqa: BLE001 防护兜底：见函数 docstring
+            consecutive += 1
+            logger.exception("[周期线程 %s] 第 %d 次连续异常（%s: %s），"
+                             "退避 %.1fs 后继续下一拍",
+                             tname, consecutive, type(exc).__name__, exc,
+                             backoff_s)
+            if consecutive >= max_consecutive:
+                reason = "连续%d次异常，最后一次 %s: %s" % (
+                    consecutive, type(exc).__name__, exc)
+                logger.critical("[周期线程 %s] 线程已死！%s —— 已留死亡标记"
+                                "（状态槽 dead_threads），"
+                                "请排查文件锁/底层IO健康状态", tname, reason)
+                mark_cycle_thread_dead(tname, reason)
+                if on_death is not None:
+                    try:
+                        on_death(tname, reason)
+                    except Exception:  # noqa: BLE001 死亡回调不得掩盖主流程
+                        logger.exception("[周期线程 %s] on_death 回调异常",
+                                         tname)
+                return
+            if consecutive >= escalation_after:
+                logger.warning("[周期线程 %s] 连续异常升级告警（第 %d/%d 次）"
+                               "——疑似持续性故障，达 %d 次线程将退出",
+                               tname, consecutive, max_consecutive,
+                               max_consecutive)
+            _cycle_wait(stop_evt, backoff_s)
+
+
+# ==============================================================================
 # 1. 跨平台文件锁（共享内存通道写入互斥）
 # ==============================================================================
 
@@ -1095,29 +1199,30 @@ class DistributedRuntime:
         logger.info("[%s] 运行时已停止", self.node_id)
 
     def _heartbeat_loop(self) -> None:
-        """心跳线程：周期发布心跳消息 + 原子更新状态槽（宕机注入时静默）。"""
-        while not self._stop_evt.is_set():
-            if not self.faults.halted():
-                self.publish(Topics.heartbeat_of(self.node_id),
-                             EventType.HEARTBEAT,
-                             {"node": self.node_id, "role": self.role,
-                              "fb_count": len(self._fbs),
-                              "leader_epoch": self.epoch},
-                             priority=Priority.HIGH)
-                write_status(self.node_id, self.snapshot_status(),
-                             self.runtime_dir)
-            else:
-                # 故障注入"宕机"：写一个显式 halted 状态让 UI 立刻变红
-                snap = self.snapshot_status(state="halted")
-                snap["fault"] = "injected-down"
-                write_status(self.node_id, snap, self.runtime_dir)
-            self._stop_evt.wait(self.heartbeat_interval)
+        """心跳线程（经 guarded_cycle 统一防护，复审报告10 N1）。"""
+        guarded_cycle(self._stop_evt, self.heartbeat_interval,
+                      self._heartbeat_tick, "hb")
+
+    def _heartbeat_tick(self) -> None:
+        """心跳单拍：发布心跳消息 + 原子更新状态槽（宕机注入时静默）。"""
+        if not self.faults.halted():
+            self.publish(Topics.heartbeat_of(self.node_id),
+                         EventType.HEARTBEAT,
+                         {"node": self.node_id, "role": self.role,
+                          "fb_count": len(self._fbs),
+                          "leader_epoch": self.epoch},
+                         priority=Priority.HIGH)
+            write_status(self.node_id, self.snapshot_status(),
+                         self.runtime_dir)
+        else:
+            # 故障注入"宕机"：写一个显式 halted 状态让 UI 立刻变红
+            snap = self.snapshot_status(state="halted")
+            snap["fault"] = "injected-down"
+            write_status(self.node_id, snap, self.runtime_dir)
 
     def _fault_poll_loop(self) -> None:
-        """故障指令轮询线程（500ms 刷新一次注入指令）。"""
-        while not self._stop_evt.is_set():
-            self.faults.refresh()
-            self._stop_evt.wait(0.5)
+        """故障指令轮询线程（500ms 一拍，经 guarded_cycle 统一防护）。"""
+        guarded_cycle(self._stop_evt, 0.5, self.faults.refresh, "fault-poll")
 
     # ==========================================================================
     # 9.5 状态快照（心跳/状态槽/Web 控制台共用）
@@ -1137,6 +1242,8 @@ class DistributedRuntime:
             "fbs": [fb.snapshot() for fb in self._fbs.values()],
             "scheduler": self.scheduler.stats(),
             "bus": self.bus.stats_snapshot(),
+            # 已死亡的周期线程（"线程已死"状态标记，运维/Web 可见）
+            "dead_threads": sorted(dead_cycle_threads()),
         }
 
     def apply_fb_config(self, fb_name: str, params: Dict[str, Any]) -> List[str]:
