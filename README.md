@@ -1,5 +1,9 @@
 # IEC 61499 分布式工业控制系统
 
+[![CI](https://github.com/lwj15089590118/IEC61499-Distributed-Industrial-Control-System/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/IEC61499-Distributed-Industrial-Control-System/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
 > 基于 IEC 61499 功能块标准的分布式工业控制系统模拟平台 —— 事件驱动调度 · 双通道通信 · 热备冗余 · Web 在线组态
 
 ## 1. 项目简介
@@ -56,6 +60,22 @@ flowchart TB
 | 优先级事件总线 | CRITICAL > HIGH > NORMAL > LOW，故障切换消息永不被任务洪峰淹没 |
 | 热备冗余 | 主控状态快照持续同步；心跳超时后备用节点 **50ms 内**（实测 ~1.4ms）完成接管 |
 | 一致性保障 | 领导者租约 + epoch fencing token，杜绝脑裂；接收侧按"本地已见最大纪元"拒绝旧纪元派发指令（含执行节点，见 `tests/` 回归） |
+
+## ⭐ 热备接管实测（自动化回归真实事件流）
+
+以下两图由 `tests/test_failover.py` 集成用例**真实运行数据**渲染：拉起 5 个真实节点子进程
+（纯共享内存通道、临时运行时目录），下单→完成→注入主控宕机→node_e 接管→接管态继续下单→
+kill node_a→再完成一单，全部事件来自共享事件流 `bus.jsonl` 的真实时间戳。
+
+![热备接管时间线](docs/img/failover_timeline.png)
+
+*接管时间线：node_e 判定主控失联后发布 `FailoverTriggered`（payload 实测接管耗时 1.44ms、epoch=2），
+旧主控 node_a 的 StateSync 在接管后停发（0.5s 后 0 条，测试断言通过）；此后派发全部来自 node_e。*
+
+![派发去重统计](docs/img/failover_dedup.png)
+
+*派发去重统计：failover 前后共 7 个任务，每个任务"派发×1 / 完成×1"，零重复派发、零重复执行，
+派发与完成集合一致——由 `test_failover_zero_duplicate_dispatch` 自动化断言（对应复审报告10 P0 的回归保障）。*
 
 ## 3. 目录结构
 
@@ -175,7 +195,68 @@ python simulator/fault_injector.py clear
 | 7 | 视觉质检闭环 | OK/NG/复检判定 + 缺陷类别回传主控 |
 | 8 | Web 在线组态 | 参数下发 → 功能块生效 → 回执事件流可见 |
 | 9 | 故障注入三件套 | 宕机/延迟/丢包均可注入、到期自动恢复 |
-| 10 | 自动化回归测试 | `pytest tests/`：failover 零重复派发 / ECC 迁移表 / 主题匹配全覆盖 / fencing 与队列背压 |
+| 10 | 自动化回归测试 | `pytest tests/`（47 用例，含 2 个 5 节点真实子进程 failover 集成）：failover 零重复派发 / ECC 迁移表 / 主题匹配全覆盖 / fencing 与队列背压 / 周期线程存活 |
 
 > 说明：本项目定位为 IEC 61499 **语义仿真**（事件驱动执行、功能块/ECC/端口概念映射），
 > 未实现 61499-2 交换格式（.fbt/.sys）与服务接口/复合 FB，不与 FORTE/4DIAC 互操作。
+
+## 8. FAQ（常见问题）
+
+**Q1：ECC 是什么？怎么执行的？**
+ECC（Execution Control Chain，执行控制链）是 IEC 61499 Basic FB 内的事件驱动状态机。
+实现见 `core/function_block.py` 的 `ECC` 类：事件输入到来 → 在当前状态的出边中按
+priority 查找"事件匹配且守卫为真"的迁移 → 执行源状态 exit 动作 → 切换目标状态并执行
+entry 动作；无匹配迁移则状态保持（事件被忽略，符合标准语义）。每个功能块的
+`handle_event` 统一完成端口校验、WITH 关联数据刷新、ECC 驱动与执行统计，
+迁移表逐条固化在 `tests/test_ecc.py` 回归。
+
+**Q2：热备切换怎么保证不重复派发？**
+租约 + epoch 双门控的纵深防御：① 发送侧总闸——halted / demoted / 租约归他人三条件任一
+即停发快照与派发，`FailoverTriggered` 同时把旧主控置 demoted；② 接收侧副本双门控——
+纪元单调递增 + 发送方必须是当前租约领导者；③ 接管方 node_e 以更高 epoch 发布派发。
+端到端由 `tests/test_failover.py`（5 个真实子进程）断言全集群零重复派发/零重复执行，
+见上方"热备接管实测"截图。
+
+**Q3：旧纪元指令怎么被拒绝？**
+全节点（含执行节点）维护本地已见最大纪元 `_max_seen_epoch`（`core/distributed_runtime.py`），
+接收侧对 `epoch < _max_seen_epoch` 的派发类指令直接拒绝并告警，纪元基准随消息持续单调更新；
+状态槽导出 max_seen_epoch 便于观测。回归见 `tests/test_runtime_fencing.py`（旧纪元拒收 /
+同纪元放行 / 非派发事件不闸）。
+
+**Q4：与 FORTE / 4DIAC 是什么关系？**
+没有直接关系。本项目为自研简化运行时，做 IEC 61499 的**语义仿真**（事件驱动执行、
+功能块/ECC/端口的概念级映射），未实现 61499-2 交换格式（.fbt/.sys）与服务接口 FB/
+复合 FB，不与 FORTE/4DIAC 互操作、也不加载其工程文件——这是如实的定位声明，不是"兼容实现"。
+
+**Q5：paho-mqtt 1.x / 2.x 都兼容吗？**
+兼容。构造 MQTT 客户端时按 `hasattr(mqtt, "CallbackAPIVersion")` 自动区分 2.x/1.x 两代
+回调 API 分支构造（`core/distributed_runtime.py`），整体 try 包裹、构造失败置
+`_client=None` 并自动降级为纯共享内存通道——装不上 Broker 也不影响单机全功能运行。
+本机 paho-mqtt 1.6.1 实测通过（`tests/test_runtime_fencing.py::TestPahoCompat`）。
+
+**Q6：测试怎么跑？需要先装 MQTT Broker 吗？**
+不需要。`python -m pytest tests -q` 共 47 个用例（含 2 个 5 节点真实子进程 failover
+集成用例，全量约 20s）；集成用例通过临时运行时目录 + `IEC61499_CONFIG` 环境变量把
+整个集群指向纯共享内存通道，完全隔离、可重复执行。
+
+## 9. Roadmap（后续规划）
+
+以下为复审报告（第二轮，2026-09-02）"残留风险与下一步行动"中**尚未完成**的真实规划，
+已完成项（周期定时线程统一异常防护 N1、CI 接入 GitHub Actions）不再列出：
+
+- 【P2】node_e pump 检查 `lease.leader != "node_e"` 即自 demote 回热备，删除
+  `max()` 采纳外部纪元的路径，彻底关闭同纪元双主控的残余窗口（报告10 N2）；
+- 【P2】halted/demoted 期间主控对 NEW_ORDER 回 `ORDER_REJECT`，杜绝宕机窗口订单
+  滞留与影子队列（报告10 N3）；
+- 【P2】接管态补任务失败重试闭环，或明示 at-least-once 语义并增加 worker 侧
+  task_id 幂等（报告10 N4）；
+- 【P2 清尾】故障注入 delay 移出发送方 worker 线程、`_ext_*` 过期清除、
+  `configure()` 类型校验、p95 末尾 -1 修复、FIFO docstring 校准（上轮 P2-3/6/7/9/10）；
+- 【测试补强】补两条失败注入用例：在途任务未完成时 kill node_a（恢复语义与重复上界）、
+  node_e active 后 node_a 重启（无双主控）；
+- 【P3】跨主机租约时钟偏移说明或改单调钟、`_drain_pending` 递归改循环、
+  order_generator/web-ui 尊重配置的 runtime_dir。
+
+## 10. 许可证
+
+本项目以 [MIT License](LICENSE) 开源 · Copyright (c) 2026 lwj15089590118
