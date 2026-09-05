@@ -169,6 +169,12 @@ python simulator/fault_injector.py clear
 实时事件流、每秒事件速率折线图、事件类型分布饼图，并可通过表单
 **手动下发订单**与**在线修改功能块参数**（如视觉 NG 判定阈值）。
 
+![Web 控制台](docs/img/webui.png)
+
+*控制台实况（真实集群运行渲染）：5 节点在线（node_a 主控 epoch=1 / node_e 热备），
+表单下发"电机外壳×3"订单后主控分解派发——事件流实时滚动，StateSync 台账
+dispatched 9 / completed 9 / failed 0（跨节点任务流转+回执闭环）。*
+
 ## 6. 核心设计一览
 
 - **事件即消息**：跨节点事件统一封装为 `Message`（含 msg_id/优先级/epoch），对应 IEC 61499 中"事件输入/输出 + WITH 数据关联"的语义（概念级映射；不含 61499-2 交换格式与 SIF/复合 FB）；
