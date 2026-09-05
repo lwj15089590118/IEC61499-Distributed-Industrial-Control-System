@@ -75,7 +75,7 @@ kill node_a→再完成一单，全部事件来自共享事件流 `bus.jsonl` �
 ![派发去重统计](docs/img/failover_dedup.png)
 
 *派发去重统计：failover 前后共 7 个任务，每个任务"派发×1 / 完成×1"，零重复派发、零重复执行，
-派发与完成集合一致——由 `test_failover_zero_duplicate_dispatch` 自动化断言（对应复审报告10 P0 的回归保障）。*
+派发与完成集合一致——由 `test_failover_zero_duplicate_dispatch` 自动化断言（failover 零重复派发的自动化回归保障）。*
 
 ## 3. 目录结构
 
@@ -241,17 +241,16 @@ entry 动作；无匹配迁移则状态保持（事件被忽略，符合标准�
 
 ## 9. Roadmap（后续规划）
 
-以下为复审报告（第二轮，2026-09-02）"残留风险与下一步行动"中**尚未完成**的真实规划，
-已完成项（周期定时线程统一异常防护 N1、CI 接入 GitHub Actions）不再列出：
+以下为**尚未完成**的真实规划（周期定时线程统一异常防护、CI 接入 GitHub Actions 等已完成项不再列出）：
 
 - 【P2】node_e pump 检查 `lease.leader != "node_e"` 即自 demote 回热备，删除
-  `max()` 采纳外部纪元的路径，彻底关闭同纪元双主控的残余窗口（报告10 N2）；
+  `max()` 采纳外部纪元的路径，彻底关闭同纪元双主控的残余窗口；
 - 【P2】halted/demoted 期间主控对 NEW_ORDER 回 `ORDER_REJECT`，杜绝宕机窗口订单
-  滞留与影子队列（报告10 N3）；
+  滞留与影子队列；
 - 【P2】接管态补任务失败重试闭环，或明示 at-least-once 语义并增加 worker 侧
-  task_id 幂等（报告10 N4）；
+  task_id 幂等；
 - 【P2 清尾】故障注入 delay 移出发送方 worker 线程、`_ext_*` 过期清除、
-  `configure()` 类型校验、p95 末尾 -1 修复、FIFO docstring 校准（上轮 P2-3/6/7/9/10）；
+  `configure()` 类型校验、p95 末尾 -1 修复、FIFO docstring 校准；
 - 【测试补强】补两条失败注入用例：在途任务未完成时 kill node_a（恢复语义与重复上界）、
   node_e active 后 node_a 重启（无双主控）；
 - 【P3】跨主机租约时钟偏移说明或改单调钟、`_drain_pending` 递归改循环、
